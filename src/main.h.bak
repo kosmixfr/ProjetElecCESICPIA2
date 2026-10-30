@@ -1,0 +1,75 @@
+#pragma once
+
+// Meme chose
+int main();
+
+void loop();
+
+struct Record
+{
+  double Latitude;
+  double Longitude;
+  struct tm *DateTime;
+  float Temperature;
+  float Humidity;
+  float Pressure;
+};
+
+struct Parameters
+{
+  char *Name;
+  long Value;
+  long MinValue;
+  long MaxValue;
+  char *Description;
+};
+
+// 2=erreruaccesauxdonnesdugps
+// 1=erreurd'accesàl'horlogertc
+// 3=erreuraccesauxdonnéesd'uncapteur
+// 4=donnesincohérented'uncapteur
+// 5=Erreur d’accès ou d’écriture sur la carte SD
+// 6=Carte SD pleine
+void OnImprimeLerreurViaLed(int);
+
+void ModeNormal(bool);
+void ModeConfig();
+void ModeMaintenance();
+Parameters *GetParam(char *);
+
+Parameters losParametros[12] = {
+    {"LOG_INTERVAL", 10, 1, 1440,
+     "Intervalle entre deux mesures (minutes)"},
+
+    {"TIMEOUT", 30, 1, 255,
+     "Delai maximum d'attente d'un capteur (secondes)"},
+
+    {"FILE_MAX_SIZE", 2048, 1, 65535,
+     "Taille maximale d'un fichier de log (octets)"},
+
+    {"LUMIN", 1, 0, 1,
+     "Activation du capteur de luminosite"},
+
+    {"LUMIN_LOW", 255, 0, 1023,
+     "Seuil de luminosite faible"},
+
+    {"LUMIN_HIGH", 768, 0, 1023,
+     "Seuil de luminosite forte"},
+
+    {"TEMP_AIR", 1, 0, 1,
+     "Activation du capteur de temperature de l'air"},
+
+    {"MIN_TEMP_AIR", -10, -40, 85,
+     "Temperature minimale autorisee (degres Celsius)"},
+
+    {"MAX_TEMP_AIR", 60, -40, 85,
+     "Temperature maximale autorisee (degres Celsius)"},
+
+    {"HYGR", 1, 0, 1,
+     "Activation du capteur d'hygrometrie"},
+
+    {"HYGR_MINT", 0, -40, 85,
+     "Temperature minimale pour les mesures d'hygrometrie"},
+
+    {"HYGR_MAXT", 50, -40, 85,
+     "Temperature maximale pour les mesures d'hygrometrie"}};
