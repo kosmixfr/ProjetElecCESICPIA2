@@ -20,14 +20,16 @@
  
 #define SIX_SEVEN_SIX 6
 #define SIX_SEVEN_SEVEN 7
-#define CLK_LED 4
-#define DATA_LED 5
+#define CLK_LED 8
+#define DATA_LED 9
 #define LED_COUNT 1
 #define VERSION 1
 #define NUMERO_LOT 1
-#define CAPTEUR_TIMEOUT 1000
+#define CAPTEUR_TIMEOUT 25000
 #define BOUTON_ROUGE 2
 #define BOUTON_VERT 3
+#define RTC_RETRY 5
+#define CAPTEUR_RETRY 5
 #define EEPROM_MAGIC 0xACAB
 #define EEPROM_VERSION 2
 #define EEPROM_LOT 3
@@ -42,13 +44,21 @@ TinyGPSPlus gps;
 // Pile, size :2
 float LesKordonnesGps[2];
 const int MaxFileSize = 1000;
+// CS de la carte SD : D4 (cablage materiel MOSI=D11 MISO=D12 SCK=D13).
+// La LED a ete deplacee sur D8/D9 pour liberer D4 (et D3 = bouton vert !).
 const int SD_CS = 4;
 // library for the BME280 sensor
 Adafruit_BME280 capteur;
-// clock for the RTC DS3231j
-RTC_DS3231 rtc_clock;
+// Grove RTC DS1307 (adresse I2C 0x68, alimenter en 5V !)
+// Absent si compilation avec -DSANS_RTC (env uno_sans_rtc).
+#ifndef SANS_RTC
+RTC_DS1307 rtc_clock;
+#endif
  
 int SumCapteurError = 0;
+// Maintenance en interieur : autorise les mesures sans position GPS
+// (position affichee 0.00000). Les modes normal/eco exigent toujours le GPS.
+bool sansPositionOk = false;
 
 enum ModeFonctionnement
 {
@@ -61,7 +71,69 @@ enum ModeFonctionnement
 ModeFonctionnement modeActuel = MODE_STANDARD;
  
  
-ChainableLED leds(CLK_LED, DATA_LED, LED_COUNT); // CLK=3, DATA=4
+ChainableLED leds(CLK_LED, DATA_LED, LED_COUNT);
+
+// --- Signalisation LED (voir spec) : couleur continue par mode, clignotant 1 Hz par erreur ---
+#define COUL_NOIR 0
+#define COUL_VERT 1
+#define COUL_JAUNE 2
+#define COUL_BLEU 3
+#define COUL_ORANGE 4
+#define COUL_ROUGE 5
+#define COUL_BLANC 6
+
+static const uint8_t COULEURS_LED[][3] PROGMEM = {
+    {0, 0, 0},       // noir : eteint
+    {0, 255, 0},     // vert : mode standard
+    {255, 255, 0},   // jaune : mode configuration
+    {0, 0, 255},     // bleu : mode economique
+    {255, 165, 0},   // orange : mode maintenance
+    {255, 0, 0},     // rouge : erreurs
+    {255, 255, 255}, // blanc : erreurs carte SD
+};
+
+// noinline+noclone : garde un seul exemplaire generique de setColorRGB
+// (une specialisation par constantes couterait ~250 o de flash chacune).
+__attribute__((noinline, noclone)) static void AppliqueCouleur(uint8_t idx)
+{
+  leds.setColorRGB(0,
+                   pgm_read_byte(&COULEURS_LED[idx][0]),
+                   pgm_read_byte(&COULEURS_LED[idx][1]),
+                   pgm_read_byte(&COULEURS_LED[idx][2]));
+}
+
+__attribute__((noinline, noclone)) static void AfficheCouleurMode()
+{
+  switch (modeActuel)
+  {
+  case MODE_CONFIG:
+    AppliqueCouleur(COUL_JAUNE);
+    break;
+  case MODE_ECO:
+    AppliqueCouleur(COUL_BLEU);
+    break;
+  case MODE_MAINTENANCE:
+    AppliqueCouleur(COUL_ORANGE);
+    break;
+  default:
+    AppliqueCouleur(COUL_VERT); // MODE_STANDARD
+    break;
+  }
+}
+
+// Alterne 2 couleurs (durees en ms, 1 Hz => 500/500 ; 2x plus long => 333/667)
+// 4 cycles puis retour a la couleur du mode en cours.
+__attribute__((noinline, noclone)) static void ClignoteLed(uint8_t c1, uint8_t c2, int d1_ms, int d2_ms)
+{
+  for (uint8_t i = 0; i < 4; i++)
+  {
+    AppliqueCouleur(c1);
+    delay(d1_ms);
+    AppliqueCouleur(c2);
+    delay(d2_ms);
+  }
+  AfficheCouleurMode();
+}
  
 SoftwareSerial gpsSerial(SIX_SEVEN_SIX, SIX_SEVEN_SEVEN); // RX, TX
  
@@ -77,7 +149,7 @@ void SaveEepromParameters()
 
 void InitLed()
 {
-  leds.setColorRGB(0, 0, 0, 0);
+  AppliqueCouleur(COUL_NOIR);
 }
 
 void InitEeprom()
@@ -110,16 +182,64 @@ void InitEeprom()
   }
 }
 
-void InitRtc()
+void ScannerI2C()
 {
-  if (!rtc_clock.begin())
+  uint8_t n = 0;
+  for (uint8_t a = 1; a < 127; a++)
   {
-    OnImprimeLerreurViaLed(1);
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0)
+    {
+      Serial.print(F("I2C 0x"));
+      Serial.println(a, HEX);
+      n++;
+    }
+    Wire.clearWireTimeoutFlag();
+  }
+  if (!n)
+  {
+    Serial.println(F("I2C vide"));
   }
 }
 
+void InitRtc()
+{
+#ifdef SANS_RTC
+  Serial.println(F("RTC desactivee (SANS_RTC)"));
+  return;
+#else
+  for (int essai = 0; essai < RTC_RETRY; essai++)
+  {
+    Wire.clearWireTimeoutFlag();
+    if (rtc_clock.begin())
+    {
+      Wire.clearWireTimeoutFlag();
+      return;
+    }
+    Wire.clearWireTimeoutFlag();
+    delay(100);
+  }
+  OnImprimeLerreurViaLed(1);
+#endif
+}
+
+#ifdef SANS_RTC
+// Horloge fictive quand la RTC est absente : 01/01/2026 00:00:00 UTC
+// + secondes ecoulees depuis le boot. Monotone donc triable et compatible
+// avec la rotation des fichiers journaliers ; repart de zero a chaque reset.
+// (Une date vraiment aleatoire casserait l'ordre des mesures et des fichiers.)
+#define FAUSSE_DATE_BASE 1767225600UL // 01/01/2026 00:00:00 UTC
+DateTime GenererDateSansRtc()
+{
+  return DateTime(FAUSSE_DATE_BASE + millis() / 1000UL);
+}
+#endif
+
 void InitSd()
 {
+  // En mode maitre SPI, SS (D10 sur Uno) doit rester en sortie
+  // meme quand le CS de la SD est ailleurs (ici D4).
+  pinMode(10, OUTPUT);
   if (!SD.begin(SD_CS))
   {
     OnImprimeLerreurViaLed(5);
@@ -128,13 +248,27 @@ void InitSd()
 
 void InitCapteur()
 {
-  if (!capteur.begin(0x76))
+  bool ok = false;
+  for (int essai = 0; essai < CAPTEUR_RETRY && !ok; essai++)
   {
-    if (!capteur.begin(0x77))
+    Wire.clearWireTimeoutFlag();
+    ok = capteur.begin(0x76);
+    Wire.clearWireTimeoutFlag();
+    if (!ok)
     {
-      Serial.println(F("Erreur : BME280 introuvable !"));
-      OnImprimeLerreurViaLed(3);
+      ok = capteur.begin(0x77);
+      Wire.clearWireTimeoutFlag();
     }
+    if (!ok)
+    {
+      delay(100);
+    }
+  }
+  if (!ok)
+  {
+    Serial.println(F("Erreur : BME280 introuvable !"));
+    OnImprimeLerreurViaLed(3);
+    return;
   }
 }
 
@@ -253,17 +387,25 @@ void setup()
 {
   Serial.begin(9600);
   Serial.println(F("Lancement"));
-  InitGps();
-  InitBoutons();
 
-  Wire.setWireTimeout(CAPTEUR_TIMEOUT);
+  // I2C en premier : le timeout court + SoftwareSerial actif perturbaient
+  // les init RTC/BME (timeout 1 ms, flag jamais efface).
   Wire.begin();
+  // 25 ms + reset auto du bus sur timeout (recommandation Wire AVR).
+  Wire.setWireTimeout(CAPTEUR_TIMEOUT, true);
+  Wire.clearWireTimeoutFlag();
 
+  InitBoutons();
   InitLed();
+  ScannerI2C();
   InitRtc();
+  InitCapteur();
   InitSd();
   InitEeprom();
-  InitCapteur();
+
+  // GPS en dernier : SoftwareSerial bavard fausse les timings I2C,
+  // et l'ancien InitGps bloquait tout sans fix.
+  InitGps();
 
   modeActuel = (BoutonRougePresse() || BoutonRougeAppui()) ? MODE_CONFIG : MODE_STANDARD;
 }
@@ -338,9 +480,18 @@ void PompeGps()
 void InitGps()
 {
   gpsSerial.begin(9600);
+  // Timeout anti-blocage : sans fix au bout de 120 s on continue,
+  // GetNewRecord() signalera l'erreur 2 quand il faudra un fix frais.
+  const unsigned long TIMEOUT_GPS_MS = 120000UL;
+  unsigned long debut = millis();
   while (!gps.location.isValid())
   {
     PompeGps();
+    if (millis() - debut >= TIMEOUT_GPS_MS)
+    {
+      OnImprimeLerreurViaLed(2);
+      return;
+    }
   }
   LesKordonnesGps[0] = gps.location.lat();
   LesKordonnesGps[1] = gps.location.lng();
@@ -348,34 +499,42 @@ void InitGps()
 
 Record *GetNewRecord(int withGps)
 {
-  // Position : fix GPS frais si demandé, sinon dernière position connue
+  // Position : fix GPS frais si demandé, sinon dernière position connue.
+  // En maintenance interieure (sansPositionOk), on mesure meme sans fix.
   if (withGps)
   {
     PompeGps();
-    if (!gps.location.isValid())
+    if (gps.location.isValid())
+    {
+      LesKordonnesGps[0] = gps.location.lat();
+      LesKordonnesGps[1] = gps.location.lng();
+    }
+    else if (!sansPositionOk)
     {
       OnImprimeLerreurViaLed(2);
       return NULL;
     }
-    LesKordonnesGps[0] = gps.location.lat();
-    LesKordonnesGps[1] = gps.location.lng();
   }
   // utilisation impossible au 0,0 du globe (aucune position connue)
-  if (LesKordonnesGps[0] == 0 && LesKordonnesGps[1] == 0)
+  if (!sansPositionOk && LesKordonnesGps[0] == 0 && LesKordonnesGps[1] == 0)
   {
     OnImprimeLerreurViaLed(2);
     return NULL;
   }
 
   // Capteur BME280 : pression convertie de Pa en hPa
-  unsigned long timeout = GetParam(F("TIMEOUT"))->Value;
+  // TIMEOUT est en secondes (cf. losParametros), duree est en ms.
+  unsigned long timeout = (unsigned long)GetParam(F("TIMEOUT"))->Value * 1000UL;
   unsigned long debut = millis();
+  Wire.clearWireTimeoutFlag();
   float temperature = capteur.readTemperature();
   float pression = capteur.readPressure() / 100.0f;
   float humidity = capteur.readHumidity();
+  bool timeoutI2C = Wire.getWireTimeoutFlag();
+  Wire.clearWireTimeoutFlag();
   unsigned long duree = millis() - debut;
 
-  if (isnan(temperature) || isnan(pression) || isnan(humidity) || duree > timeout)
+  if (isnan(temperature) || isnan(pression) || isnan(humidity) || timeoutI2C || duree > timeout)
   {
     SumCapteurError++;
     if (SumCapteurError >= 2)
@@ -391,7 +550,22 @@ Record *GetNewRecord(int withGps)
     return NULL;
   }
 
-  DateTime maintenant = rtc_clock.now();
+  DateTime maintenant;
+#ifdef SANS_RTC
+  maintenant = GenererDateSansRtc();
+#else
+  {
+    Wire.clearWireTimeoutFlag();
+    maintenant = rtc_clock.now();
+    bool rtcTimeout = Wire.getWireTimeoutFlag();
+    Wire.clearWireTimeoutFlag();
+    if (rtcTimeout)
+    {
+      OnImprimeLerreurViaLed(1);
+      return NULL;
+    }
+  }
+#endif
 
   Record *record_ptr = (Record *)malloc(sizeof(Record));
   if (record_ptr == NULL)
@@ -617,18 +791,25 @@ void PrintRecord(Record *record)
  
 void ModeMaintenance()
 {
+  sansPositionOk = true;
   while (1)
   {
     if (BoutonRougeAppuiLong())
     {
       Serial.println(F("Retour en mode standard"));
       modeActuel = MODE_STANDARD;
+      sansPositionOk = false;
       return;
     }
 
+    // GetNewRecord rend NULL (erreur deja signalee) quand la mesure echoue :
+    // on n'imprime rien, PrintRecord(NULL) ne ferait que des lignes vides.
     Record *record = GetNewRecord(true);
-    PrintRecord(record);
-    free(record);
+    if (record != NULL)
+    {
+      PrintRecord(record);
+      free(record);
+    }
     for (int i = 0; i < 100; i++)
     {
       PompeGps();
@@ -639,6 +820,7 @@ void ModeMaintenance()
 
 void ModeNormalOrEco(bool ecoMode)
 {
+  sansPositionOk = false;
   if(ecoMode){
     Serial.println(F("ModeEco"));
   }else{
@@ -745,7 +927,8 @@ void ModeConfig()
   }
 }
  
-// Affiche le code d'erreur sur la liaison serie (LED pas encore cablee)
+// Signale le code d'erreur : message serie + LED (cf. spec).
+// Clignotants a 1 Hz : durees egales => 500/500, "2x plus long" => 333/667.
 void OnImprimeLerreurViaLed(int mode)
 {
   Serial.print(F("Erreur "));
@@ -754,21 +937,27 @@ void OnImprimeLerreurViaLed(int mode)
   {
   case 1:
     Serial.println(F(" : horloge RTC"));
+    ClignoteLed(COUL_ROUGE, COUL_BLEU, 500, 500);
     break;
   case 2:
     Serial.println(F(" : GPS sans fix"));
+    ClignoteLed(COUL_ROUGE, COUL_JAUNE, 500, 500);
     break;
   case 3:
     Serial.println(F(" : capteur BME280"));
+    ClignoteLed(COUL_ROUGE, COUL_VERT, 500, 500);
     break;
   case 4:
     Serial.println(F(" : donnee capteur incoherente"));
+    ClignoteLed(COUL_ROUGE, COUL_VERT, 333, 667);
     break;
   case 5:
     Serial.println(F(" : acces carte SD"));
+    ClignoteLed(COUL_ROUGE, COUL_BLANC, 333, 667);
     break;
   case 6:
     Serial.println(F(" : carte SD pleine"));
+    ClignoteLed(COUL_ROUGE, COUL_BLANC, 500, 500);
     break;
   default:
     Serial.println();
@@ -779,6 +968,13 @@ void OnImprimeLerreurViaLed(int mode)
  
 void loop()
 {
+  // Couleur continue du mode en cours (uniquement lors d'un changement).
+  static ModeFonctionnement dernierModeAffiche = MODE_MAINTENANCE;
+  if (modeActuel != dernierModeAffiche)
+  {
+    dernierModeAffiche = modeActuel;
+    AfficheCouleurMode();
+  }
   switch (modeActuel)
   {
   case MODE_CONFIG:

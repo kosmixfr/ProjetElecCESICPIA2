@@ -35,7 +35,7 @@ const int SD_CS = 10;
 // library for the BME280 sensor
 Adafruit_BME280 capteur;
 // clock for the RTC DS3231
-RTC_DS3231 rtc_clock;
+RTC_DS1307 rtc_clock;
  
 int SumCapteurError = 0;
  

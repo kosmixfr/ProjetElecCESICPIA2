@@ -14,6 +14,7 @@ void InitEeprom();
 void InitRtc();
 void InitSd();
 void InitCapteur();
+void ScannerI2C();
 void InitBoutons();
 bool BoutonRougePresse();
 bool BoutonVertPresse();
