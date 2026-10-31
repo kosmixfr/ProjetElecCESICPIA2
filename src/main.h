@@ -14,7 +14,6 @@ void InitEeprom();
 void InitRtc();
 void InitSd();
 void InitCapteur();
-void ScannerI2C();
 void InitBoutons();
 bool BoutonRougePresse();
 bool BoutonVertPresse();
@@ -57,6 +56,8 @@ void ModeMaintenance();
 Parameters *GetParam(const char *);
 Parameters *GetParam(const __FlashStringHelper *);
 int ValidCapteurData(const __FlashStringHelper *nomMin, const __FlashStringHelper *nomMax, float value);
+char *FormatDecimal(float value, uint8_t decimales, char *out);
+void AfficheLigne(const __FlashStringHelper *libelle, const char *valeur);
 
 // Noms des parametres : stockes en flash (PROGMEM) pour ne pas occuper la RAM
 static const char NOM_LOG_INTERVAL[] PROGMEM = "LOG_INTERVAL";

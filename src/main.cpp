@@ -136,7 +136,7 @@ __attribute__((noinline, noclone)) static void ClignoteLed(uint8_t c1, uint8_t c
 }
  
 SoftwareSerial gpsSerial(SIX_SEVEN_SIX, SIX_SEVEN_SEVEN); // RX, TX
- 
+
 void SaveEepromParameters()
 {
   int adresse = EEPROM_PARAMS;
@@ -182,30 +182,10 @@ void InitEeprom()
   }
 }
 
-void ScannerI2C()
-{
-  uint8_t n = 0;
-  for (uint8_t a = 1; a < 127; a++)
-  {
-    Wire.beginTransmission(a);
-    if (Wire.endTransmission() == 0)
-    {
-      Serial.print(F("I2C 0x"));
-      Serial.println(a, HEX);
-      n++;
-    }
-    Wire.clearWireTimeoutFlag();
-  }
-  if (!n)
-  {
-    Serial.println(F("I2C vide"));
-  }
-}
-
 void InitRtc()
 {
 #ifdef SANS_RTC
-  Serial.println(F("RTC desactivee (SANS_RTC)"));
+  Serial.println(F("Sans RTC"));
   return;
 #else
   for (int essai = 0; essai < RTC_RETRY; essai++)
@@ -281,25 +261,57 @@ struct EtatBouton
   bool longSignale; // appui long deja declenche pour cette pression
   unsigned long derniereModif;
   unsigned long debut;
+  volatile bool evenement; // pose par l'ISR externe, traite par ActualiserBouton
 };
 
-volatile EtatBouton boutonRouge;
-volatile EtatBouton boutonVert;
+// Seul 'evenement' est partage avec les ISR : pas de volatile global,
+// pas de section critique pour les autres champs (contexte boucle uniquement).
+EtatBouton boutonRouge;
+EtatBouton boutonVert;
 
-static inline void ScannerBouton(volatile EtatBouton &bouton, unsigned long maintenant)
+// ISR minimales : un simple drapeau. Tout le traitement (anti-rebond,
+// appui, appui long) est fait en contexte boucle par ActualiserBouton,
+// donc sans contrainte de temps d'ISR et sans millis() en interruption.
+static void InterruptionBoutonRouge()
 {
-  bool niveau = digitalRead(bouton.pin) == LOW;
+  boutonRouge.evenement = true;
+}
 
-  if (niveau != bouton.enfonce && (maintenant - bouton.derniereModif) >= ANTI_REBOND_MS)
+static void InterruptionBoutonVert()
+{
+  boutonVert.evenement = true;
+}
+
+// Traite les fronts signales par attachInterrupt + scrute l'appui long
+// (aucun front ne se produit pendant un maintien : d'ou la scrutation).
+// noinline : une seule copie partagee (flash presque pleine).
+// Appelee par chaque accesseur Bouton* et par PompeGps (qui tourne dans
+// toutes les attentes : pas d'angle mort, meme pendant InitGps).
+__attribute__((noinline)) static void ActualiserBouton(EtatBouton &bouton)
+{
+  // Prise atomique du drapeau : un front ISR pendant la lecture est
+  // soit vu (avant), soit conserve pour le prochain appel (apres).
+  noInterrupts();
+  bool evenement = bouton.evenement;
+  bouton.evenement = false;
+  interrupts();
+
+  unsigned long maintenant = millis();
+
+  if (evenement && (maintenant - bouton.derniereModif) >= ANTI_REBOND_MS)
   {
-    bouton.enfonce = niveau;
-    bouton.derniereModif = maintenant;
-    if (niveau)
+    bool niveau = digitalRead(bouton.pin) == LOW;
+    if (niveau != bouton.enfonce)
     {
-      bouton.appui = true;
-      bouton.debut = maintenant;
-      bouton.appuiLong = false;
-      bouton.longSignale = false;
+      bouton.enfonce = niveau;
+      bouton.derniereModif = maintenant;
+      if (niveau)
+      {
+        bouton.appui = true;
+        bouton.debut = maintenant;
+        bouton.appuiLong = false;
+        bouton.longSignale = false;
+      }
     }
   }
 
@@ -311,19 +323,12 @@ static inline void ScannerBouton(volatile EtatBouton &bouton, unsigned long main
   }
 }
 
-ISR(TIMER1_COMPA_vect)
+static bool PrendreEvenement(bool &drapeau)
 {
-  unsigned long maintenant = millis();
-  ScannerBouton(boutonRouge, maintenant);
-  ScannerBouton(boutonVert, maintenant);
-}
-
-static bool PrendreEvenement(volatile bool &drapeau)
-{
-  noInterrupts();
+  // Pas de section critique : en contexte boucle uniquement, l'ISR
+  // ne touche plus qu'a 'evenement' (bool, acces atomique sur AVR).
   bool valeur = drapeau;
   drapeau = false;
-  interrupts();
   return valeur;
 }
 
@@ -342,15 +347,13 @@ void InitBoutons()
   boutonVert.debut = millis();
   boutonRouge.derniereModif = millis();
   boutonVert.derniereModif = millis();
+  // appuiLong/longSignale/evenement : deja a false via l'init .bss.
 
-  noInterrupts();
-  TCCR1A = 0;
-  TCCR1B = 0;
-  TCNT1 = 0;
-  OCR1A = 249;
-  TCCR1B = _BV(WGM12) | _BV(CS11) | _BV(CS10);
-  TIMSK1 = _BV(OCIE1A);
-  interrupts();
+  // Interruptions externes sur fronts montants ET descendants (CHANGE) :
+  // D2 = INT0, D3 = INT1 sur Uno. L'ISR ne pose qu'un drapeau ;
+  // anti-rebond + appui long dans ActualiserBouton (boucle).
+  attachInterrupt(digitalPinToInterrupt(BOUTON_ROUGE), InterruptionBoutonRouge, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(BOUTON_VERT), InterruptionBoutonVert, CHANGE);
 }
 
 bool BoutonRougePresse()
@@ -365,21 +368,25 @@ bool BoutonVertPresse()
 
 bool BoutonRougeAppui()
 {
+  ActualiserBouton(boutonRouge);
   return PrendreEvenement(boutonRouge.appui);
 }
 
 bool BoutonVertAppui()
 {
+  ActualiserBouton(boutonVert);
   return PrendreEvenement(boutonVert.appui);
 }
 
 bool BoutonRougeAppuiLong()
 {
+  ActualiserBouton(boutonRouge);
   return PrendreEvenement(boutonRouge.appuiLong);
 }
 
 bool BoutonVertAppuiLong()
 {
+  ActualiserBouton(boutonVert);
   return PrendreEvenement(boutonVert.appuiLong);
 }
 
@@ -396,8 +403,13 @@ void setup()
   Wire.clearWireTimeoutFlag();
 
   InitBoutons();
+  // Memorise la demande de config des maintenant : les inits suivantes
+  // (RTC, capteur, SD, GPS jusqu'a 120 s) sont bloquantes et l'utilisateur
+  // peut relacher le bouton avant la fin du setup.
+  bool demandeConfig = BoutonRougePresse() || BoutonRougeAppui();
   InitLed();
-  ScannerI2C();
+  // Pas de scan I2C ici : 242 o de flash economises (projet a ~99.9 %).
+  // Un probleme I2C remonte de toute facon via les erreurs 1 (RTC) et 3 (BME280).
   InitRtc();
   InitCapteur();
   InitSd();
@@ -407,7 +419,24 @@ void setup()
   // et l'ancien InitGps bloquait tout sans fix.
   InitGps();
 
-  modeActuel = (BoutonRougePresse() || BoutonRougeAppui()) ? MODE_CONFIG : MODE_STANDARD;
+  modeActuel = (demandeConfig || BoutonRougePresse() || BoutonRougeAppui()) ? MODE_CONFIG : MODE_STANDARD;
+  if (modeActuel == MODE_CONFIG)
+  {
+    Serial.println(F("=CONFIG="));
+    Serial.print(F("> "));
+    // L'entree en config exigeait ROUGE tenu au reset, mais les inits
+    // suivantes bloquent (GPS jusqu'a 120 s sans fix) : a l'arrivee ici
+    // un bouton encore tenu depasse deja les 5 s et provoquait une sortie
+    // immediate vers STANDARD. On neutralise l'appui long en cours
+    // (longSignale arme : ignore jusqu'au prochain front) : la sortie
+    // exigera un NOUVEL appui long de 5 s. Idem pour VERT (ECO intempestif).
+    // Ecritures 1 octet donc atomiques sur AVR : pas de section critique.
+    // (Les drapeaux d'appui court ne sont plus lus apres le setup.)
+    boutonRouge.appuiLong = false;
+    boutonRouge.longSignale = true;
+    boutonVert.appuiLong = false;
+    boutonVert.longSignale = true;
+  }
 }
 
 // Ecrit v avec 'decimales' decimales dans out, sans printf flottant (economie de flash).
@@ -466,8 +495,12 @@ bool GetFile(DateTime *date, File &fichier)
  
 
 // Lit les octets recus du GPS. A appeler souvent : le buffer SoftwareSerial ne fait que 64 octets.
+// En profite pour actualiser les boutons : tourne dans toutes les attentes
+// (InitGps, modes normal/eco/maintenance), donc pas d'angle mort malgre les phases bloquantes.
 void PompeGps()
 {
+  ActualiserBouton(boutonRouge);
+  ActualiserBouton(boutonVert);
   while (gpsSerial.available())
   {
     gps.encode(gpsSerial.read());
@@ -484,9 +517,19 @@ void InitGps()
   // GetNewRecord() signalera l'erreur 2 quand il faudra un fix frais.
   const unsigned long TIMEOUT_GPS_MS = 120000UL;
   unsigned long debut = millis();
+#ifdef SANS_RTC
+  unsigned long dernierPoint = 0;
+#endif
   while (!gps.location.isValid())
   {
     PompeGps();
+#ifdef SANS_RTC
+    if (millis() - dernierPoint >= 5000UL)
+    {
+      dernierPoint = millis();
+      Serial.write('.');
+    }
+#endif
     if (millis() - debut >= TIMEOUT_GPS_MS)
     {
       OnImprimeLerreurViaLed(2);
@@ -503,7 +546,16 @@ Record *GetNewRecord(int withGps)
   // En maintenance interieure (sansPositionOk), on mesure meme sans fix.
   if (withGps)
   {
-    PompeGps();
+    // Fenetre d'ecoute ~1,5 s : une phrase NMEA fait ~80 o (~80 ms a 9600 baud).
+    // Un seul PompeGps() instantane ne drainait que le contenu actuel du buffer
+    // 64 o et ratait quasi a coup sur la trame complete -> Erreur 2 abusive.
+    // PompeGps() actualise aussi les boutons : pas d'angle mort pendant l'ecoute.
+    // Sortie anticipee des que le fix est valide.
+    for (uint8_t i = 0; i < 150 && !gps.location.isValid(); i++)
+    {
+      PompeGps();
+      delay(10);
+    }
     if (gps.location.isValid())
     {
       LesKordonnesGps[0] = gps.location.lat();
@@ -656,10 +708,24 @@ Parameters *GetParam(const __FlashStringHelper *name)
 // nomMin / nomMax : noms des parametres bornes (en flash)
 int ValidCapteurData(const __FlashStringHelper *nomMin, const __FlashStringHelper *nomMax, float value)
 {
+  // Debug Erreur 4 : affiche la valeur fautive + LA borne violée.
+  // Testé en deux temps (MIN d'abord) : un seul pointeur de nom survit
+  // aux appels dans chaque chemin (garder les deux coûtait ~94 o).
   int minVal = GetParam(nomMin)->Value;
-  int maxVal = GetParam(nomMax)->Value;
-  if (value < minVal || value > maxVal)
+  if (value < minVal)
   {
+    char texte[16];
+    FormatDecimal(value, 2, texte);
+    AfficheLigne(nomMin, texte);
+    OnImprimeLerreurViaLed(4);
+    return 1;
+  }
+  int maxVal = GetParam(nomMax)->Value;
+  if (value > maxVal)
+  {
+    char texte[16];
+    FormatDecimal(value, 2, texte);
+    AfficheLigne(nomMax, texte);
     OnImprimeLerreurViaLed(4);
     return 1;
   }
@@ -796,7 +862,7 @@ void ModeMaintenance()
   {
     if (BoutonRougeAppuiLong())
     {
-      Serial.println(F("Retour en mode standard"));
+      Serial.println(F("Mode standard"));
       modeActuel = MODE_STANDARD;
       sansPositionOk = false;
       return;
@@ -844,7 +910,7 @@ void ModeNormalOrEco(bool ecoMode)
     {
       if (BoutonVertAppuiLong() && !ecoMode)
       {
-        Serial.println(F("Passage en mode economique"));
+        Serial.println(F("Mode eco"));
         modeActuel = MODE_ECO;
         return;
       }
@@ -857,7 +923,7 @@ void ModeNormalOrEco(bool ecoMode)
         }
         else
         {
-          Serial.println(F("Passage en mode maintenance"));
+          Serial.println(F("Mode maintenance"));
           modeActuel = MODE_MAINTENANCE;
         }
         return;
@@ -875,27 +941,57 @@ void ModeNormalOrEco(bool ecoMode)
 }
 void ModeConfig()
 {
-  // Serial.println("=== Mode configuration ===");
-  // Serial.print("Imprimer la commande :");
-  char commande[40];
-  int currentCommandeIndex = 0;
-  char valeur[40];
-  int currentValeurIndex = 0;
-  int haveEqual = false;
+  // Buffers STATIC : loop() rappelle ModeConfig() en boucle (non bloquant).
+  // A 9600 baud les caracteres arrivent ~1/ms : une ligne arrive en plusieurs
+  // appels. En variables locales, tout etait perdu a chaque retour -> Entree
+  // semblait ne rien faire. En static, la ligne se reconstitue entre appels.
+  // 16 o suffisent : noms <= 13 car. + '\0', valeurs <= 6 chiffres + '\0'.
+  static char commande[16];
+  static uint8_t currentCommandeIndex = 0;
+  static char valeur[16];
+  static uint8_t currentValeurIndex = 0;
+  static bool haveEqual = false;
   while (Serial.available())
   {
     char caractere = Serial.read();
- 
-    if (caractere == '\r' || caractere == '\n')
+
+    if (caractere == '\r' || caractere == '\n' || caractere == '\0')
     {
-      commande[currentCommandeIndex] = '\0';
-      valeur[currentValeurIndex] = '\0';
-      (ProcessCommande(commande, valeur));
+      // Ignore les lignes vides (les terminaux envoient "\r\n" : le 2e
+      // caractere arrive sur des buffers deja vides). haveEqual garde les
+      // saisies type "=5" pour repondre "Commande inconnu" au lieu du silence.
+      if (currentCommandeIndex > 0 || haveEqual)
+      {
+        commande[currentCommandeIndex] = '\0';
+        valeur[currentValeurIndex] = '\0';
+        const __FlashStringHelper *reponse = ProcessCommande(commande, valeur);
+        if (reponse)
+        {
+          Serial.println(reponse);
+        }
+        else
+        {
+          SaveEepromParameters();
+          Serial.println(F("OK"));
+        }
+        Serial.print(F("> "));
+      }
       currentCommandeIndex = 0;
       currentValeurIndex = 0;
       haveEqual = false;
       continue;
     }
+
+    // Caractere de controle (ESC des fleches / Suppr, etc.) : ignore,
+    // sans echo, pour ne pas perturber l'affichage du terminal.
+    if (caractere < ' ')
+    {
+      continue;
+    }
+
+    // Echo : le moniteur PlatformIO n'affiche pas les caracteres tapes
+    // (pas d'echo local), la carte les renvoie donc au fur et a mesure.
+    Serial.write(caractere);
     
     
     if (caractere == '=')
@@ -906,10 +1002,10 @@ void ModeConfig()
     
     else
     {
-      // Les buffers font 40 o (39 caracteres + '\0') : on ignore le surplus
+      // Les buffers font 16 o (15 caracteres + '\0') : on ignore le surplus
       if (haveEqual)
       {
-        if (currentValeurIndex < 39)
+        if (currentValeurIndex < 15)
         {
           valeur[currentValeurIndex] = caractere;
           currentValeurIndex++;
@@ -917,7 +1013,7 @@ void ModeConfig()
       }
       else
       {
-        if (currentCommandeIndex < 39)
+        if (currentCommandeIndex < 15)
         {
           commande[currentCommandeIndex] = caractere;
           currentCommandeIndex++;
@@ -929,39 +1025,53 @@ void ModeConfig()
  
 // Signale le code d'erreur : message serie + LED (cf. spec).
 // Clignotants a 1 Hz : durees egales => 500/500, "2x plus long" => 333/667.
+// Factorise en un seul Serial.println + un seul ClignoteLed (flash pleine).
 void OnImprimeLerreurViaLed(int mode)
 {
   Serial.print(F("Erreur "));
   Serial.print(mode);
+  const __FlashStringHelper *msg = NULL;
+  uint8_t c2 = COUL_BLANC;
+  int d1 = 500, d2 = 500;
   switch (mode)
   {
   case 1:
-    Serial.println(F(" : horloge RTC"));
-    ClignoteLed(COUL_ROUGE, COUL_BLEU, 500, 500);
+    msg = F(" : horloge RTC");
+    c2 = COUL_BLEU;
     break;
   case 2:
-    Serial.println(F(" : GPS sans fix"));
-    ClignoteLed(COUL_ROUGE, COUL_JAUNE, 500, 500);
+    msg = F(" : GPS sans fix");
+    c2 = COUL_JAUNE;
     break;
   case 3:
-    Serial.println(F(" : capteur BME280"));
-    ClignoteLed(COUL_ROUGE, COUL_VERT, 500, 500);
+    msg = F(" : BME280");
+    c2 = COUL_VERT;
     break;
   case 4:
-    Serial.println(F(" : donnee capteur incoherente"));
-    ClignoteLed(COUL_ROUGE, COUL_VERT, 333, 667);
+    msg = F(" : incoherent");
+    c2 = COUL_VERT;
+    d1 = 333;
+    d2 = 667;
     break;
   case 5:
-    Serial.println(F(" : acces carte SD"));
-    ClignoteLed(COUL_ROUGE, COUL_BLANC, 333, 667);
+    msg = F(" : SD acces");
+    d1 = 333;
+    d2 = 667;
     break;
   case 6:
-    Serial.println(F(" : carte SD pleine"));
-    ClignoteLed(COUL_ROUGE, COUL_BLANC, 500, 500);
+    msg = F(" : carte SD pleine");
     break;
   default:
-    Serial.println();
     break;
+  }
+  if (msg)
+  {
+    Serial.println(msg);
+    ClignoteLed(COUL_ROUGE, c2, d1, d2);
+  }
+  else
+  {
+    Serial.println();
   }
 }
  
@@ -979,7 +1089,11 @@ void loop()
   {
   case MODE_CONFIG:
     ModeConfig();
-    modeActuel = MODE_STANDARD;
+    // On reste en config jusqu'a un appui long rouge (5 s).
+    if (BoutonRougeAppuiLong())
+    {
+      modeActuel = MODE_STANDARD;
+    }
     break;
 
   case MODE_STANDARD:
