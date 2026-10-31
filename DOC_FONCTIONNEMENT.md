@@ -152,7 +152,8 @@ Boucle infinie :
 
 - rouge long → `« Retour en mode standard »`, `modeActuel=STANDARD`, `sansPositionOk=false`, return.
 - `record = GetNewRecord(true)` ; si non-NULL → `PrintRecord(record)` + `free(record)`.
-  Si NULL (erreur déjà signalée), on n'imprime rien.
+  Si NULL (erreur déjà signalée par `Erreur N`), affiche `Echec mesure`
+  (preuve de vie : sans ça un capteur muet donnait un silence total).
 - `100 x { PompeGps(); delay(10); }` ≈ 1 s entre affichages tout en nourrissant le GPS.
 
 `PrintRecord()` : tableau série `| Date : ... |`, `Latitude`, `Longitude`,

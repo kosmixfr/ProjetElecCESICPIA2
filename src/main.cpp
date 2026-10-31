@@ -851,7 +851,6 @@ void PrintRecord(Record *record)
   AfficheLigne(F("Humidite"), humidite);
   AfficheLigne(F("Pression"), pression);
  
-  Serial.println(F("+--------------------------------------+"));
   Serial.println();
 }
  
@@ -869,12 +868,17 @@ void ModeMaintenance()
     }
 
     // GetNewRecord rend NULL (erreur deja signalee) quand la mesure echoue :
-    // on n'imprime rien, PrintRecord(NULL) ne ferait que des lignes vides.
+    // on affiche quand meme un message (sinon silence total entre deux
+    // erreurs, le 1er echec capteur etant volontairement muet).
     Record *record = GetNewRecord(true);
     if (record != NULL)
     {
       PrintRecord(record);
       free(record);
+    }
+    else
+    {
+      Serial.println(F("Echec mesure"));
     }
     for (int i = 0; i < 100; i++)
     {
@@ -887,11 +891,7 @@ void ModeMaintenance()
 void ModeNormalOrEco(bool ecoMode)
 {
   sansPositionOk = false;
-  if(ecoMode){
-    Serial.println(F("ModeEco"));
-  }else{
-    Serial.println(F("ModeNormal"));
-  }
+  Serial.println(ecoMode ? F("ModeEco") : F("ModeNormal"));
   int shouldDoGPS = true;
   unsigned long intervalle = (unsigned long)GetParam(F("LOG_INTERVAL"))->Value * 1000 * (ecoMode ? 2 : 1);
  
