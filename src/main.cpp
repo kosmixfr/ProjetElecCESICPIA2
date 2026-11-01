@@ -62,6 +62,127 @@ bool sansPositionOk = false;
 // Le Record est statique, jamais alloue : le tas (~300 o libres) est trop
 // petit pour malloc (SD + pile) et malloc refusait (ex-Echec 7).
 uint8_t codeEchec = 0;
+// SD prete ou non : InitSd le pose, GetFile le repose a false sur echec
+// et retente SD.begin (carte reinseree). Evite les SD.open repetes sur
+// un bus mort (pics de courant -> brown-out + "Lancement" en boucle).
+bool carteSdOk = false;
+
+// --- DIAGNOSTIC RESET (temporaire : a retirer une fois le reset trouve) ---
+// Variable en .noinit : non reinitialisee au reset, donc conservee d'un reset
+// a l'autre. Au boot suivant, setup() affiche la derniere etape atteinte et la
+// pile libre minimale mesuree avant le reset.
+#define DIAG_MAGIC 0xD1A6
+struct DiagReset
+{
+  uint16_t magic;
+  uint8_t etape;
+  uint16_t pileMin;
+};
+static DiagReset diag __attribute__((section(".noinit")));
+// Symboles fournis par l'edition de liens AVR (debut du tas, fin du tas)
+extern int __heap_start, *__brkval;
+static char *diagDebut = 0;
+static char *diagFin = 0;
+// Sommet maximal du tas atteint depuis le boot (adresse) : les blocs liberes
+// redescendent __brkval mais leurs anciennes donnees ne sont pas de la pile.
+static uint16_t diagTasMax = 0;
+
+// Peint la RAM libre (au-dessus du tas, sous la pile) avec 0xAA.
+// La pile qui descend ecrit dessus : la premiere case modifiee donne le
+// point le plus bas atteint (tas compris). Marge de 64 o sous le cadre.
+__attribute__((noinline)) static void DiagPeintPile()
+{
+  char *debut = (char *)(__brkval == 0 ? (int)&__heap_start : (int)__brkval);
+  char marque;
+  char *fin = &marque - 64;
+  for (char *p = debut; p < fin; p++)
+  {
+    *p = (char)0xAA;
+  }
+  diagDebut = debut;
+  diagFin = fin;
+  diagTasMax = (uint16_t)(int)debut;
+  diag.pileMin = (uint16_t)(fin - debut);
+}
+
+// Pile libre = octets intacts entre le sommet du tas (malloc) et la pile.
+// Compte depuis __brkval : le tas (BME280 'new', SD 'malloc') ecrit sous
+// son sommet et ne doit pas etre compte comme pile.
+static uint16_t DiagTasBase()
+{
+  return (uint16_t)(__brkval == 0 ? (int)&__heap_start : (int)__brkval);
+}
+
+__attribute__((noinline)) static uint16_t DiagPileLibre()
+{
+  uint16_t base = DiagTasBase();
+  if (base > diagTasMax)
+  {
+    diagTasMax = base;
+  }
+  char *tas = (char *)diagTasMax;
+  char *p = tas;
+  while (p < diagFin && (uint8_t)*p == 0xAA)
+  {
+    p++;
+  }
+  return (uint16_t)(p - tas);
+}
+
+// Tas maximal utilise (octets depuis le debut du tas). A appeler apres DiagPileLibre.
+static uint16_t DiagTasUtilise()
+{
+  return (uint16_t)(diagTasMax - (uint16_t)(int)&__heap_start);
+}
+
+static void AfficheNombre(uint16_t n);
+
+// Repere l'etape courante (0 = setup), garde la pile libre minimale et
+// l'affiche : chaque ligne "E<etape> <pile>" precede un eventuel crash.
+static void Etape(uint8_t e)
+{
+  diag.etape = e;
+  uint16_t libre = DiagPileLibre();
+  if (libre < diag.pileMin)
+  {
+    diag.pileMin = libre;
+  }
+  Serial.write('E');
+  Serial.write((char)(e < 10 ? '0' + e : 'A' + (e - 10)));
+  Serial.write(' ');
+  AfficheNombre(libre);
+  Serial.write(' ');
+  AfficheNombre(DiagTasUtilise());
+  Serial.println();
+}
+
+static void AfficheNombre(uint16_t n)
+{
+  if (n >= 10)
+  {
+    AfficheNombre(n / 10);
+  }
+  Serial.write((char)('0' + n % 10));
+}
+
+// Affiche l'etape et la pile minimale du reset precedent, puis reinitialise.
+static void DiagDemarrage()
+{
+  if (diag.magic == DIAG_MAGIC)
+  {
+    Serial.print(F("Reset: etape "));
+    Serial.write((char)('0' + diag.etape));
+    Serial.print(F(" pile min "));
+    AfficheNombre(diag.pileMin);
+    Serial.println();
+  }
+  else
+  {
+    Serial.println(F("Reset: diag absent"));
+  }
+  diag.magic = DIAG_MAGIC;
+  diag.etape = 0;
+}
 
 enum ModeFonctionnement
 {
@@ -140,6 +261,17 @@ __attribute__((noinline, noclone)) static void ClignoteLed(uint8_t c1, uint8_t c
  
 SoftwareSerial gpsSerial(SIX_SEVEN_SIX, SIX_SEVEN_SEVEN); // RX, TX
 
+// Bornes lues en PROGMEM (voir LesBornes dans main.h)
+static long BorneMin(int i)
+{
+  return (long)pgm_read_dword(&LesBornes[i].Min);
+}
+
+static long BorneMax(int i)
+{
+  return (long)pgm_read_dword(&LesBornes[i].Max);
+}
+
 void SaveEepromParameters()
 {
   int adresse = EEPROM_PARAMS;
@@ -177,7 +309,7 @@ void InitEeprom()
   {
     long valeur = losParametros[i].Value;
     EEPROM.get(adresse, valeur);
-    if (valeur >= losParametros[i].MinValue && valeur <= losParametros[i].MaxValue)
+    if (valeur >= BorneMin(i) && valeur <= BorneMax(i))
     {
       losParametros[i].Value = valeur;
     }
@@ -223,10 +355,27 @@ void InitSd()
   // En mode maitre SPI, SS (D10 sur Uno) doit rester en sortie
   // meme quand le CS de la SD est ailleurs (ici D4).
   pinMode(10, OUTPUT);
-  if (!SD.begin(SD_CS))
+  digitalWrite(10, HIGH);
+  // CS explicite a HIGH avant begin : libere MISO, puis delai
+  // de demarrage carte (certaines cartes exigent ~200-300 ms
+  // apres mise sous tension, sinon SD.begin echoue -> Erreur 5).
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  delay(300);
+  // 3 essais : la 1re init echoue souvent a froid (alim/carte lente).
+  for (uint8_t i = 0; i < 3; i++)
   {
-    OnImprimeLerreurViaLed(5);
+    if (SD.begin(SD_CS))
+    {
+      carteSdOk = true;
+      return;
+    }
+    SD.end();
+    delay(500);
   }
+  OnImprimeLerreurViaLed(5);
+  // Aide au cablage (1 ligne flash) : cause n°1 = CS, format, contact.
+  Serial.println(F("Verif CS=4 FAT32 carte enfoncee"));
 }
 
 void InitCapteur()
@@ -398,6 +547,9 @@ void setup()
 {
   Serial.begin(9600);
   Serial.println(F("Lancement"));
+  DiagDemarrage();
+  DiagPeintPile();
+  Etape(1);
 
   // I2C en premier : le timeout court + SoftwareSerial actif perturbaient
   // les init RTC/BME (timeout 1 ms, flag jamais efface).
@@ -414,13 +566,18 @@ void setup()
   InitLed();
   // Pas de scan I2C ici : 242 o de flash economises (projet a ~99.9 %).
   // Un probleme I2C remonte de toute facon via les erreurs 1 (RTC) et 3 (BME280).
+  Etape(10); // 'A' : avant InitRtc
   InitRtc();
+  Etape(11); // 'B' : avant InitCapteur
   InitCapteur();
+  Etape(12); // 'C' : avant InitSd
   InitSd();
+  Etape(13); // 'D' : avant InitEeprom
   InitEeprom();
 
   // GPS en dernier : SoftwareSerial bavard fausse les timings I2C,
   // et l'ancien InitGps bloquait tout sans fix.
+  Etape(2);
   InitGps();
 
   modeActuel = (demandeConfig || BoutonRougePresse() || BoutonRougeAppui()) ? MODE_CONFIG : MODE_STANDARD;
@@ -443,7 +600,8 @@ void setup()
   }
 }
 
-// Ecrit v avec 'decimales' decimales dans out, sans printf flottant (economie de flash).
+// Ecrit v avec 'decimales' decimales dans out, sans printf (flash pleine :
+// sprintf_P tirerait vfprintf ~950 o). Partie entiere via ltoa.
 // Renvoie un pointeur vers la fin de la chaine ecrite.
 char *FormatDecimal(float v, uint8_t decimales, char *out)
 {
@@ -459,7 +617,13 @@ char *FormatDecimal(float v, uint8_t decimales, char *out)
     facteur *= 10;
   }
   long valeur = (long)(v * facteur + 0.5f);
-  p += sprintf_P(p, PSTR("%ld."), valeur / facteur);
+  char tmp[12];
+  ltoa(valeur / facteur, tmp, 10);
+  for (char *q = tmp; *q; q++)
+  {
+    *p++ = *q;
+  }
+  *p++ = '.';
   long fraction = valeur % facteur;
   for (long diviseur = facteur / 10; diviseur > 0; diviseur /= 10)
   {
@@ -474,16 +638,45 @@ char *FormatDecimal(float v, uint8_t decimales, char *out)
 // false=erreur
 bool GetFile(DateTime *date, File &fichier)
 {
+  Etape(6);
+  // Carte tombee ou reinseree apres le boot : une seule retentative
+  // (pas de boucle serree -> pics de courant -> reset "Lancement").
+  if (!carteSdOk)
+  {
+    digitalWrite(SD_CS, HIGH);
+    if (!SD.begin(SD_CS))
+    {
+      OnImprimeLerreurViaLed(5);
+      return false;
+    }
+    carteSdOk = true;
+  }
   long max_size = GetParam(F("FILE_MAX_SIZE"))->Value;
   char nomFichier[13];
   for (int i = 0; i < 10; i++)
   {
-    sprintf_P(nomFichier, PSTR("%02d%02d%02d_%d.LOG"),
-            date->year() % 100, date->month(), date->day(), i);
+    // Nom 8.3 manuel (sans sprintf_P -> vfprintf ~950 o economises).
+    uint8_t yy = date->year() % 100, mm = date->month(), dd = date->day();
+    nomFichier[0] = '0' + yy / 10;
+    nomFichier[1] = '0' + yy % 10;
+    nomFichier[2] = '0' + mm / 10;
+    nomFichier[3] = '0' + mm % 10;
+    nomFichier[4] = '0' + dd / 10;
+    nomFichier[5] = '0' + dd % 10;
+    nomFichier[6] = '_';
+    nomFichier[7] = '0' + i;
+    nomFichier[8] = '.';
+    nomFichier[9] = 'L';
+    nomFichier[10] = 'O';
+    nomFichier[11] = 'G';
+    nomFichier[12] = '\0';
     fichier = SD.open(nomFichier, FILE_WRITE);
     if (!fichier)
     {
-      fichier.close();
+      // Ne pas close() un File invalide. Marque le bus mort pour
+      // retenter SD.begin au prochain appel (reinsertion possible).
+      carteSdOk = false;
+      SD.end();
       OnImprimeLerreurViaLed(5);
       return false;
     }
@@ -546,6 +739,7 @@ void InitGps()
 
 Record *GetNewRecord(int withGps)
 {
+  Etape(3);
   codeEchec = 0;
   // Position : fix GPS frais si demandé, sinon dernière position connue.
   // En maintenance interieure (sansPositionOk), on mesure meme sans fix.
@@ -584,6 +778,7 @@ Record *GetNewRecord(int withGps)
   unsigned long timeout = (unsigned long)GetParam(F("TIMEOUT"))->Value * 1000UL;
   unsigned long debut = millis();
   Wire.clearWireTimeoutFlag();
+  Etape(4);
   float temperature = capteur.readTemperature();
   float pression = capteur.readPressure() / 100.0f;
   float humidity = capteur.readHumidity();
@@ -608,6 +803,7 @@ Record *GetNewRecord(int withGps)
     return NULL;
   }
 
+  Etape(5);
   DateTime maintenant;
 #ifdef SANS_RTC
   maintenant = GenererDateSansRtc();
@@ -678,7 +874,8 @@ const __FlashStringHelper *ProcessCommande(char commande[], char value[])
   {
     nombre = -nombre;
   }
-  if (nombre < param->MinValue || nombre > param->MaxValue)
+  int idx = param - losParametros;
+  if (nombre < BorneMin(idx) || nombre > BorneMax(idx))
   {
     return F("Valeur out of bound !!");
   }
@@ -748,21 +945,29 @@ int AppendSdCard(Record *record)
   {
     return 1;
   }
-  char buffer[64];
-  char *p = buffer;
-  p = FormatDecimal(record->Latitude, 6, p);
-  *p++ = ';';
-  p = FormatDecimal(record->Longitude, 6, p);
-  *p++ = ';';
-  p = FormatDecimal(record->Temperature, 2, p);
-  *p++ = ';';
-  p = FormatDecimal(record->Humidity, 2, p);
-  *p++ = ';';
-  p = FormatDecimal(record->Pressure, 2, p);
-  *p++ = '\n';
-  *p = '\0';
-  size_t longueur = p - buffer;
-  if (fichier.write((const uint8_t *)buffer, longueur) != longueur)
+  // Ecriture morceau par morceau avec un seul champ[12] : buffer[48/64]
+  // + File + SD depassait la pile (~270 o libres) -> "Mo?" + reset.
+  // champ[12] suffit : plus grand champ "-180.123456" = 11 + '\0' = 12.
+  Etape(7);
+  char champ[12];
+  char *fin;
+  bool ok = true;
+  fin = FormatDecimal(record->Latitude, 6, champ);
+  ok &= (fichier.write((const uint8_t *)champ, fin - champ) == (size_t)(fin - champ));
+  ok &= (fichier.write((uint8_t)';') == 1);
+  fin = FormatDecimal(record->Longitude, 6, champ);
+  ok &= (fichier.write((const uint8_t *)champ, fin - champ) == (size_t)(fin - champ));
+  ok &= (fichier.write((uint8_t)';') == 1);
+  fin = FormatDecimal(record->Temperature, 2, champ);
+  ok &= (fichier.write((const uint8_t *)champ, fin - champ) == (size_t)(fin - champ));
+  ok &= (fichier.write((uint8_t)';') == 1);
+  fin = FormatDecimal(record->Humidity, 2, champ);
+  ok &= (fichier.write((const uint8_t *)champ, fin - champ) == (size_t)(fin - champ));
+  ok &= (fichier.write((uint8_t)';') == 1);
+  fin = FormatDecimal(record->Pressure, 2, champ);
+  ok &= (fichier.write((const uint8_t *)champ, fin - champ) == (size_t)(fin - champ));
+  ok &= (fichier.write((uint8_t)'\n') == 1);
+  if (!ok)
   {
     OnImprimeLerreurViaLed(6);
   }
@@ -772,13 +977,43 @@ int AppendSdCard(Record *record)
  
 
 // Affiche une ligne du tableau. libelle est en flash (F("...")).
-// Tampon 40 o : ligne max "| "+12+" : "+19+" |" = 38 car. + '\0'.
-// (64 o + PrintRecord imbrique debordaient de la pile : RAM corrompue.)
+// Ecriture directe sans tampon ligne[40] : avec ~270 o de pile libre,
+// ligne[40] + PrintRecord + ValidCapteurData + SD corrompaient la RAM
+// ("Mo?" + reset). Format manuel, sans snprintf_P (vfprintf economise).
 void AfficheLigne(const __FlashStringHelper *libelle, const char *valeur)
 {
-  char ligne[40];
-  snprintf_P(ligne, sizeof(ligne), PSTR("| %-12S : %-19s |"), (PGM_P)libelle, valeur);
-  Serial.println(ligne);
+  Serial.write('|');
+  Serial.write(' ');
+  PGM_P f = (PGM_P)libelle;
+  uint8_t n = 0;
+  char c;
+  while (n < 12 && (c = (char)pgm_read_byte(f++)))
+  {
+    Serial.write(c);
+    n++;
+  }
+  while (n < 12)
+  {
+    Serial.write(' ');
+    n++;
+  }
+  Serial.write(' ');
+  Serial.write(':');
+  Serial.write(' ');
+  n = 0;
+  while (n < 19 && valeur[n])
+  {
+    Serial.write(valeur[n]);
+    n++;
+  }
+  while (n < 19)
+  {
+    Serial.write(' ');
+    n++;
+  }
+  Serial.write(' ');
+  Serial.write('|');
+  Serial.println();
 }
 
 void PrintRecord(Record *record)
@@ -793,17 +1028,39 @@ void PrintRecord(Record *record)
     return;
   }
  
-  char date[20];
-  snprintf_P(date, sizeof(date), PSTR("%02d/%02d/%04d %02d:%02d:%02d"),
-           record->Date.day(), record->Date.month(), record->Date.year(),
-           record->Date.hour(), record->Date.minute(), record->Date.second());
-
-  // UN SEUL tampon valeur reutilise ligne par ligne (date=19, autres<=12) :
-  // 5 tampons separes + AfficheLigne imbrique depassaient la pile libre
-  // (~269 o) et corrompaient la RAM (flot d'octets illisibles sur serie).
+  // UN SEUL tampon reutilise (date=19, autres<=12) : date[] + val[]
+  // + AfficheLigne imbrique depassaient la pile libre (~270 o) et
+  // corrompaient la RAM (flot d'octets illisibles "Mo?" sur serie).
+  // Date manuelle (sans snprintf_P -> vfprintf economise).
   char val[20];
+  {
+    char *q = val;
+    uint8_t jj = record->Date.day(), mo = record->Date.month();
+    uint16_t aa = record->Date.year();
+    uint8_t hh = record->Date.hour(), mi = record->Date.minute(), ss = record->Date.second();
+    *q++ = '0' + jj / 10;
+    *q++ = '0' + jj % 10;
+    *q++ = '/';
+    *q++ = '0' + mo / 10;
+    *q++ = '0' + mo % 10;
+    *q++ = '/';
+    *q++ = '0' + aa / 1000;
+    *q++ = '0' + (aa / 100) % 10;
+    *q++ = '0' + (aa / 10) % 10;
+    *q++ = '0' + aa % 10;
+    *q++ = ' ';
+    *q++ = '0' + hh / 10;
+    *q++ = '0' + hh % 10;
+    *q++ = ':';
+    *q++ = '0' + mi / 10;
+    *q++ = '0' + mi % 10;
+    *q++ = ':';
+    *q++ = '0' + ss / 10;
+    *q++ = '0' + ss % 10;
+    *q = '\0';
+  }
 
-  AfficheLigne(F("Date"), date);
+  AfficheLigne(F("Date"), val);
 
   FormatDecimal(record->Latitude, 5, val);
   AfficheLigne(F("Latitude"), val);
@@ -878,6 +1135,10 @@ void ModeNormalOrEco(bool ecoMode)
 {
   sansPositionOk = false;
   Serial.println(ecoMode ? F("ModeEco") : F("ModeNormal"));
+  // Flush avant GPS/BME/SD (gros appels de courant) : sans lui, un
+  // brown-out pendant SD.write tronquait le texte en "ModeNo?" sur
+  // le moniteur. Ici le texte part complet avant la mesure.
+  Serial.flush();
   int shouldDoGPS = true;
   unsigned long intervalle = (unsigned long)GetParam(F("LOG_INTERVAL"))->Value * 1000 * (ecoMode ? 2 : 1);
  
@@ -885,12 +1146,17 @@ void ModeNormalOrEco(bool ecoMode)
   {
     // Record statique : rien a liberer ici
     Record *record_ptr = GetNewRecord(shouldDoGPS);
-    if (record_ptr != NULL && AppendSdCard(record_ptr) > 0)
+    // SD en echec (5=acces, 6=pleine) : on NE revient PAS aussitot
+    // (l'ancien return relancait ModeNormal en boucle serree -> spam
+    // "Erreur 5" + pics de courant -> reset "Lancement"). On tombe
+    // dans l'attente intervalle ci-dessous puis on reessaye : la carte
+    // peut etre reinseree (GetFile retente SD.begin via carteSdOk).
+    if (record_ptr != NULL)
     {
-      modeActuel = MODE_STANDARD;
-      return;
+      AppendSdCard(record_ptr);
     }
 
+    Etape(8);
     unsigned long debut = millis();
     while (millis() - debut < intervalle)
     {
@@ -1016,7 +1282,9 @@ void OnImprimeLerreurViaLed(int mode)
 {
   codeEchec = (uint8_t)mode;
   Serial.print(F("Erreur "));
-  Serial.print(mode);
+  // write plutot que print(int) : ~200 o de division logicielle en moins
+  // (Uno a 99,5 % de flash). Codes 1..6 = un seul chiffre.
+  Serial.write((char)('0' + mode));
   const __FlashStringHelper *msg = NULL;
   uint8_t c2 = COUL_BLANC;
   int d1 = 500, d2 = 500;

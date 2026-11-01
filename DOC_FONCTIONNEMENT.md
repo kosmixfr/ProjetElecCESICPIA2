@@ -33,8 +33,11 @@ Contraintes : Uno ~32 Ko flash, projet à ~99,9 %. D'où optimisations radicales
 
 | Env | Flags | Usage |
 |---|---|---|
-| `uno` | `-flto -Os -mcall-prologues` | nominal, avec RTC |
+| `uno` | `-flto -Os -mcall-prologues -DSERIAL_RX_BUFFER_SIZE=32 -DSERIAL_TX_BUFFER_SIZE=16` | nominal, avec RTC |
 | `uno_sans_rtc` | idem + `-DSANS_RTC` | sans horloge RTC |
+
+Les tampons série (`SERIAL_*_BUFFER_SIZE`) sont réduits pour libérer de la RAM
+(voir §13). Ne pas les ré-augmenter sans vérifier la marge de pile.
 
 `uno_sans_rtc` active une horloge fictive monotone :
 `FAUSSE_DATE_BASE (01/01/2026 00:00:00 UTC) + millis()/1000`
@@ -166,7 +169,9 @@ Boucle infinie :
 
 ## 6. Paramètres et EEPROM (`main.h`, `InitEeprom`, `SaveEepromParameters`)
 
-14 paramètres en RAM (`Parameters losParametros[14]`), noms en flash `PROGMEM`
+14 paramètres en RAM (`Parameters losParametros[14]` : nom + valeur), noms en flash `PROGMEM`.
+Bornes min/max dans `LesBornes[14]` (`main.h`), en `PROGMEM` : lues par `BorneMin(i)` /
+`BorneMax(i)` (même ordre que `losParametros`). Ne pas remettre les bornes en RAM (§13).
 (`NOM_*`, 13 car. max) lus par `strcmp_P`.
 
 | Param | Défaut | Min–Max | Rôle |
@@ -303,6 +308,7 @@ ni de `malloc`/`free` (record statique : le tas est trop petit),
 `PrintRecord` réutilise un seul tampon valeur 20 o + `AfficheLigne` 40 o
 (184 o imbriqués dépassaient les ~270 o de pile libre et corrompaient la RAM
 — flot d'octets illisibles sur la série).
+Budget RAM/pile/flash : voir §13 (avant tout ajout).
 
 ---
 
@@ -311,11 +317,69 @@ ni de `malloc`/`free` (record statique : le tas est trop petit),
 1. Maintenir ROUGE au reset → mode CONFIG (LED jaune).
 2. Terminal 9600 baud : `LOG_INTERVAL=5` → `OK`, etc. ; rouge long 5 s → STANDARD.
 3. STANDARD (vert) : log toutes les `LOG_INTERVAL` s dans `AAMMJJ_0.LOG`,...
-4. Vert long → ECO (bleu, période doublée, GPS 1/2) ; rouge long → MAINTENANCE (orange,
-   tableau série chaque ~1 s) ; rouge long → STANDARD.
+4. Vert long → ECO (bleu, période doublée, GPS 1/2) ; en ECO, rouge long → STANDARD ;
+   rouge long en STANDARD → MAINTENANCE (orange, tableau série chaque ~1 s) ;
+   rouge long en MAINTENANCE → STANDARD.
 5. En `SANS_RTC`, dates fictives 01/01/2026 + uptime ; GPS timeout 120 s max au boot.
 
 Limites connues : `TIMEOUT` documenté en secondes mais comparé à `millis()` en ms
 (`*1000`), `ProcessCommande` refuse `>100000000` avant bornes, `Record.Latitude/Longitude`
 en `double` mais stockés via `float LesKordonnesGps[2]`, `MaxFileSize` global inutilisé
 (au profit du paramètre `FILE_MAX_SIZE`).
+
+---
+
+## 13. Budget mémoire — à lire avant tout ajout
+
+### 13.1 Chiffres (build actuel)
+
+| Ressource | Valeur | Remarque |
+|---|---|---|
+| RAM statique (.data + .bss + .noinit) | 1595 / 2048 o (78 %) | 1787 o avant les corrections (§13.4) |
+| Pile libre au boot | ~337 o | mesuré par le diagnostic (§13.3) |
+| Pile libre minimale (cycle de mesure) | **17 o** | pic pendant l'écriture SD : marge trop faible |
+| Tas maximal | 44 o | BME280 (4 `new` dans `begin()`), SD (1 `malloc` par `SD.open`) |
+| Flash | 99,1 % (~300 o libres) | `uno` : 99,4 % |
+
+La pile et le tas partagent la même zone de RAM (entre la fin de la RAM statique et
+`RAMEND`), sans garde : un débordement n'est pas signalé, il corrompt la mémoire
+(variables, objets `gps`/SD, adresses de retour) et provoque des resets silencieux.
+
+### 13.2 Règles pour un ajout
+
+1. Pas de nouvelle variable statique/globale sans nécessité : chaque octet statique réduit la pile.
+2. Textes et tables constants en `F()` ou `PROGMEM` (ex. `LesBornes`, §6).
+3. Chemin de mesure (`GetNewRecord`, `AppendSdCard`, `GetFile`, `ModeNormalOrEco`) : pas de
+   tableau local de plus de 16 o, pas de copie de `File` / `SdFile` ni de grosse structure.
+4. Pas de `String`, pas de `new`/`malloc` pour nos propres objets, pas de `sprintf`/`printf` flottant.
+5. Ne pas ré-augmenter les tampons série (`SERIAL_*_BUFFER_SIZE`, §2) sans mesurer la marge.
+6. Après chaque ajout : compiler `uno_sans_rtc` et `uno`, reporter RAM et flash ci-dessus,
+   puis mesurer la marge de pile (§13.3) sur un run de plusieurs minutes.
+7. Seuil proposé (à valider) : au moins 50 o de pile libre mesurée. En dessous, ne pas
+   ajouter de fonctionnalité sur le chemin de mesure avant d'avoir libéré de la RAM.
+
+### 13.3 Diagnostic temporaire (à retirer)
+
+- Code marqué « DIAGNOSTIC RESET » dans `src/main.cpp` : `diag` (en `.noinit`, conservé au reset),
+  `DiagPeintPile` (peint la RAM libre en `0xAA` au boot), `DiagPileLibre` / `DiagTasUtilise`,
+  `Etape(n)`, `DiagDemarrage`.
+- Sortie série à chaque repère : `E<étape> <pile libre> <tas max>`.
+  Étapes : `1` setup, `A` avant RTC, `B` avant capteur, `C` avant SD, `D` avant EEPROM,
+  `2` avant GPS, `3` début de mesure, `4` BME280, `5` horodatage, `6` ouverture SD,
+  `7` écriture SD, `8` attente entre mesures.
+- Au reset, la ligne `Reset: etape N pile min M` donne la dernière étape et la pile minimale
+  du run précédent. Si la RAM a été corrompue, elle affiche `diag absent` ou une valeur incohérente.
+- La pile libre est mesurée depuis le sommet maximal du tas : les blocs libérés ne faussent pas la mesure.
+- Coût : ~11 o de RAM, ~400 o de flash, et des sorties série à chaque repère (ralentissent la boucle).
+  À retirer avant de figer une version.
+
+### 13.4 Historique : boucle de reset « Lancement / ModeNormal »
+
+- Symptôme : reset périodique après `ModeNormal`, sans message d'erreur. `ModeNormal` répété et
+  `=CONFIG=` affiché au milieu de la boucle (retour de fonction corrompu).
+- Cause : la pile disposait de trop peu de place (RAM statique trop élevée) ; le tas et la pile se
+  chevauchent. Le débordement corrompt la mémoire, d'où les symptômes incohérents.
+- Corrections :
+  - bornes min/max des paramètres déplacées en `PROGMEM` (`LesBornes`) : −112 o de RAM ;
+  - tampons série réduits à 32 o (RX) et 16 o (TX) : −82 o de RAM.
+- Résultat : boucle non reproduite sur 200 s de fonctionnement. Marge de pile encore faible (17 o).

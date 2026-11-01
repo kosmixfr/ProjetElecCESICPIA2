@@ -37,8 +37,14 @@ struct Parameters
 {
   const char *Name; // chaine en PROGMEM : a lire avec strcmp_P
   long Value;
-  long MinValue;
-  long MaxValue;
+};
+
+// Bornes min/max (meme ordre que losParametros) : en PROGMEM, pas en RAM.
+// Economise 112 o de RAM : la pile deborde sinon (cf. diagnostic).
+struct Bornes
+{
+  long Min;
+  long Max;
 };
 
 // 2=erreruaccesauxdonnesdugps
@@ -76,17 +82,34 @@ static const char NOM_PRESSURE_MIN[] PROGMEM = "PRESSURE_MIN";
 static const char NOM_PRESSURE_MAX[] PROGMEM = "PRESSURE_MAX";
 
 Parameters losParametros[14] = {
-    {NOM_LOG_INTERVAL, 10, 1, 1440},
-    {NOM_TIMEOUT, 30, 1, 255},
-    {NOM_FILE_MAX_SIZE, 2048, 1, 65535},
-    {NOM_LUMIN, 1, 0, 1},
-    {NOM_LUMIN_LOW, 255, 0, 1023},
-    {NOM_LUMIN_HIGH, 768, 0, 1023},
-    {NOM_TEMP_AIR, 1, 0, 1},
-    {NOM_MIN_TEMP_AIR, -10, -40, 85},
-    {NOM_MAX_TEMP_AIR, 60, -40, 85},
-    {NOM_HYGR, 1, 0, 1},
-    {NOM_HYGR_MINT, 0, -40, 85},
-    {NOM_HYGR_MAXT, 50, -40, 85},
-    {NOM_PRESSURE_MIN, 800, 300, 1100},
-    {NOM_PRESSURE_MAX, 1100, 300, 1100}};
+    {NOM_LOG_INTERVAL, 10},
+    {NOM_TIMEOUT, 30},
+    {NOM_FILE_MAX_SIZE, 2048},
+    {NOM_LUMIN, 1},
+    {NOM_LUMIN_LOW, 255},
+    {NOM_LUMIN_HIGH, 768},
+    {NOM_TEMP_AIR, 1},
+    {NOM_MIN_TEMP_AIR, -10},
+    {NOM_MAX_TEMP_AIR, 60},
+    {NOM_HYGR, 1},
+    {NOM_HYGR_MINT, 0},
+    {NOM_HYGR_MAXT, 50},
+    {NOM_PRESSURE_MIN, 800},
+    {NOM_PRESSURE_MAX, 1100}};
+
+static const Bornes LesBornes[14] PROGMEM = {
+    {1, 1440},   // LOG_INTERVAL
+    {1, 255},    // TIMEOUT
+    {1, 65535},  // FILE_MAX_SIZE
+    {0, 1},      // LUMIN
+    {0, 1023},   // LUMIN_LOW
+    {0, 1023},   // LUMIN_HIGH
+    {0, 1},      // TEMP_AIR
+    {-40, 85},   // MIN_TEMP_AIR
+    {-40, 85},   // MAX_TEMP_AIR
+    {0, 1},      // HYGR
+    {-40, 85},   // HYGR_MINT
+    {-40, 85},   // HYGR_MAXT
+    {300, 1100}, // PRESSURE_MIN
+    {300, 1100}  // PRESSURE_MAX
+};
