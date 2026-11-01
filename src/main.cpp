@@ -505,6 +505,12 @@ static char *DeuxChiffres(char *p, uint8_t valeur)
   return p;
 }
 
+// Chiffre base 36 (0-9 puis A-Z) : 2 caracteres = 1296 valeurs.
+static char ChiffreBase36(uint8_t valeur)
+{
+  return valeur < 10 ? '0' + valeur : 'A' + valeur - 10;
+}
+
 // Comme FormatDecimal, mais ecrit "NA" si la valeur est invalide (isnan) :
 // c'est ce qu'exige le cahier des charges pour un capteur muet ou incoherent.
 static char *FormateChamp(float valeur, uint8_t decimales, char *out)
@@ -519,8 +525,11 @@ static char *FormateChamp(float valeur, uint8_t decimales, char *out)
   return FormatDecimal(valeur, decimales, out);
 }
 
-// Ouvre le fichier AAMMJJ_i.LOG du jour (i de 0 a 9) dont la taille est sous FILE_MAX_SIZE.
+// Ouvre le fichier AAMMJJrr.LOG du jour (rr = revision base 36, 1296 valeurs)
+// dont la taille est sous FILE_MAX_SIZE.
 // Nom au format 8.3 : la bibliotheque SD ne gere pas les noms longs.
+// 3 chiffres de revision + la date complete depasseraient les 8 caracteres
+// autorises, d'ou la base 36 sur 2 caracteres (00..ZZ = 1296 fichiers/jour).
 // false=erreur
 bool GetFile(DateTime *date, File &fichier)
 {
@@ -537,21 +546,22 @@ bool GetFile(DateTime *date, File &fichier)
     carteSdOk = true;
   }
   long max_size = GetParam(F("FILE_MAX_SIZE"))->Value;
-  // Nom 8.3 manuel AAMMJJ_i.LOG (sans sprintf_P -> vfprintf ~950 o economises).
+  // Nom 8.3 manuel AAMMJJrr.LOG (sans sprintf_P -> vfprintf ~950 o economises).
   char nomFichier[13];
   char *p = DeuxChiffres(nomFichier, date->year() % 100);
   p = DeuxChiffres(p, date->month());
   p = DeuxChiffres(p, date->day());
-  *p++ = '_';
   *p++ = '0'; // numero de revision, remplace dans la boucle
+  *p++ = '0';
   *p++ = '.';
   *p++ = 'L';
   *p++ = 'O';
   *p++ = 'G';
   *p = '\0';
-  for (uint8_t i = 0; i < 10; i++)
+  for (uint16_t i = 0; i < 1296; i++)
   {
-    nomFichier[7] = '0' + i; // numero de revision
+    nomFichier[6] = ChiffreBase36(i / 36); // revision 00..ZZ
+    nomFichier[7] = ChiffreBase36(i % 36);
     fichier = SD.open(nomFichier, FILE_WRITE);
     if (!fichier)
     {
@@ -871,6 +881,28 @@ static bool EcritChamp(File &fichier, char *champ, float valeur, uint8_t decimal
   return okValeur && okSeparateur;
 }
 
+// Ecrit "AA-MM-JJ HH:MM:SS;" en tete de chaque ligne de log.
+// Meme convention d'annee sur 2 chiffres que le nom de fichier AAMMJJrr.LOG.
+static bool EcritDateHeure(File &fichier, DateTime *date)
+{
+  char tampon[19];
+  char *p = DeuxChiffres(tampon, date->year() % 100);
+  *p++ = '-';
+  p = DeuxChiffres(p, date->month());
+  *p++ = '-';
+  p = DeuxChiffres(p, date->day());
+  *p++ = ' ';
+  p = DeuxChiffres(p, date->hour());
+  *p++ = ':';
+  p = DeuxChiffres(p, date->minute());
+  *p++ = ':';
+  p = DeuxChiffres(p, date->second());
+  size_t taille = (size_t)(p - tampon);
+  bool okDate = (fichier.write((const uint8_t *)tampon, taille) == taille);
+  bool okSeparateur = (fichier.write(';') == 1);
+  return okDate && okSeparateur;
+}
+
 // Ecrit record sur la SD (record statique, valide pendant l'ecriture).
 // Ecriture immediate : un lot ne tient pas en RAM (~100 o libres).
 // 1=error,0=success
@@ -884,7 +916,8 @@ int AppendSdCard(Record *record)
   // Ecriture morceau par morceau avec un seul champ[12] : buffer[48/64]
   // + File + SD depassait la pile (~270 o libres) -> "Mo?" + reset.
   char champ[12];
-  bool ok = EcritChamp(fichier, champ, record->Latitude, 6, ';');
+  bool ok = EcritDateHeure(fichier, &record->Date);
+  ok &= EcritChamp(fichier, champ, record->Latitude, 6, ';');
   ok &= EcritChamp(fichier, champ, record->Longitude, 6, ';');
   ok &= EcritChamp(fichier, champ, record->Temperature, 2, ';');
   ok &= EcritChamp(fichier, champ, record->Humidity, 2, ';');

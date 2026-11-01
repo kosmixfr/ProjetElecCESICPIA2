@@ -275,13 +275,17 @@ moins la pile) est trop petit — `malloc` refusait systématiquement).
 
 ## 9. Stockage carte SD
 
-- `GetFile(DateTime*, File&)` : cherche `AAMMJJ_i.LOG` (`i=0..9`, format 8.3 pour lib SD),
-  `sprintf_P("%02d%02d%02d_%d.LOG", yy, mm, dd, i)`, ouvre `FILE_WRITE`,
+- `GetFile(DateTime*, File&)` : cherche `AAMMJJrr.LOG` (révision `rr` en base 36 : `00..ZZ`,
+  soit 1296 fichiers/jour, > 999 ; format 8.3 pour lib SD : 6 chiffres de date + 2 de
+  révision = 8 caractères, pas de `_`), construit à la main
+  (`DeuxChiffres` + `ChiffreBase36`), ouvre `FILE_WRITE`,
   retourne le premier dont `size() < FILE_MAX_SIZE`. Échec open → **erreur 5**+`false` ;
-  les 10 pleins → **erreur 6**+`false`.
+  les 1296 pleins → **erreur 6**+`false`.
 - `AppendSdCard(Record*)` : écriture immédiate (pas de lot : ~100 o de RAM
   libre interdisent un lot de 5). `GetFile(date du record)`, écrit
-  `lat(6);lon(6);temp(2);humi(2);press(2)\n` via `EcritChamp()` (champ 12 o,
+  `AA-MM-JJ HH:MM:SS;lat(6);lon(6);temp(2);humi(2);press(2)\n` — date/heure en
+  tête via `EcritDateHeure()` (même année sur 2 chiffres que `AAMMJJrr.LOG`),
+  puis `EcritChamp()` (champ 12 o,
   `FormateChamp` → `NA` si la valeur est `NAN`). Échec partiel → **erreur 6**.
   `close()`. Retour `1=erreur, 0=ok`.
 - `FormatDecimal(float v, uint8_t decimales, char *out)` : écrit sans `%f`
@@ -347,7 +351,7 @@ Budget RAM/pile/flash : voir §13 (avant tout ajout).
 
 1. Maintenir ROUGE au reset → mode CONFIG (LED jaune).
 2. Terminal 9600 baud : `LOG_INTERVAL=5` → `OK`, etc. ; rouge long 5 s → STANDARD.
-3. STANDARD (vert) : log toutes les `LOG_INTERVAL` **minutes** dans `AAMMJJ_0.LOG`,...
+3. STANDARD (vert) : log toutes les `LOG_INTERVAL` **minutes** dans `AAMMJJ00.LOG`,...
 4. Vert long → ECO (bleu, période doublée, GPS 1/2) ; en ECO, rouge long → STANDARD ;
    rouge long en STANDARD → MAINTENANCE (orange, tableau série chaque ~1 s) ;
    rouge long en MAINTENANCE → STANDARD.
