@@ -5,7 +5,7 @@ Mesure température / humidité / pression (BME280), horodate (RTC DS1307),
 localise (GPS), stocke sur carte SD, signale par LED RGB et 2 boutons,
 configurable par liaison série.
 
-Fichiers : `src/main.cpp` (1033 lignes), `src/main.h` (paramètres + `Record`),
+Fichiers : `src/main.cpp` (~1390 lignes), `src/main.h` (paramètres + `Record`),
 `platformio.ini` (2 environnements).
 
 ---
@@ -19,8 +19,8 @@ Fichiers : `src/main.cpp` (1033 lignes), `src/main.h` (paramètres + `Record`),
 | GPS | `SoftwareSerial RX=6, TX=7` à 9600 baud | `TinyGPSPlus`, objet `gps` + `gpsSerial` |
 | Carte SD | SPI `MOSI=11 MISO=12 SCK=13`, `CS=4`, `D10` forcé en `OUTPUT` (maître SPI) | `SD.h` |
 | LED Chainable RGB | `CLK=8, DATA=9`, `LED_COUNT=1` | `ChainableLED leds` |
-| Bouton rouge | `D2`, `INPUT_PULLUP` (actif à `LOW`) | interruption Timer1 |
-| Bouton vert | `D3`, `INPUT_PULLUP` | interruption Timer1 |
+| Bouton rouge | `D2` (INT0), `INPUT_PULLUP` (actif à `LOW`) | interruption externe `CHANGE` |
+| Bouton vert | `D3` (INT1), `INPUT_PULLUP` | interruption externe `CHANGE` |
 
 > La LED a été déplacée sur D8/D9 pour libérer D4 (CS SD) — D3 est le bouton vert.
 
@@ -69,10 +69,10 @@ ModeFonctionnement modeActuel = MODE_STANDARD;
 Au boot : [ROUGE tenu au démarrage] → CONFIG
           sinon → STANDARD
 
-CONFIG ──(rouge appui long 5s)──> STANDARD
+CONFIG ──(rouge appui long 5s, ou 30 min sans saisie série)──> STANDARD
 STANDARD ──(vert appui long)──> ECO
 STANDARD ──(rouge appui long)──> MAINTENANCE
-ECO ──(rouge appui long)──> STANDARD  (retour direct, pas de maintenance)
+ECO ──(rouge appui long)──> STANDARD  (retour direct, pas de maintenance : choix retenu, §14)
 MAINTENANCE ──(rouge appui long)──> STANDARD
 ```
 
@@ -88,7 +88,7 @@ Ordre volontaire (commenté dans le code) :
 1. `Serial.begin(9600)` + `« Lancement »`.
 2. `Wire.begin()`, `Wire.setWireTimeout(25000, true)` (25 ms + reset auto bus),
    `clearWireTimeoutFlag()`. **I2C avant tout** : SoftwareSerial bavard faussait les timings.
-3. `InitBoutons()` — configure pull-ups, états initiaux, Timer1 en CTC à 1 kHz
+3. `InitBoutons()` — configure pull-ups, états initiaux, interruptions INT0/INT1
    (voir §7). Mémorise immédiatement `demandeConfig = BoutonRougePresse() || BoutonRougeAppui()`
    car les inits suivantes (RTC, SD, GPS jusqu'à 120 s) sont bloquantes et
    l'utilisateur peut relâcher avant la fin.
@@ -125,7 +125,10 @@ Contrôles `< ' '` ignorés sans echo (flèches ESC, etc.). Echo manuel par
   ~500 o), vérifie `[MinValue, MaxValue]` → `« Commande inconnu »`,
   `« Nombre invalide »`, `« Valeur out of bound !! »` ou `NULL` = succès.
   En succès : `SaveEepromParameters()` + `« OK »`. Affiche `> ` après chaque ligne.
-- Sortie testée par `loop()` : `BoutonRougeAppuiLong()` → `MODE_STANDARD`.
+- Sortie testée par `loop()` : `BoutonRougeAppuiLong()` ou 30 min sans saisie
+  (`millis() - derniereActiviteConfig >= CONFIG_INACTIVITE_MS`) → `MODE_STANDARD`.
+  `derniereActiviteConfig` est armé à l'entrée en config (fin de `setup()`) et repoussé
+  à chaque caractère reçu sur la série. Seule la saisie série compte comme activité.
   À l'entrée en config, l'appui long en cours est neutralisé (`longSignale`
   armé : un bouton encore tenu après les inits bloquantes — GPS jusqu'à 120 s —
   ne provoque pas de sortie immédiate). La sortie exige un NOUVEL appui long
@@ -151,6 +154,9 @@ Contrôles `< ' '` ignorés sans echo (flèches ESC, etc.). Echo manuel par
 ### 5.3 `ModeMaintenance()` — boucle affichage
 
 `sansPositionOk = true` → mesures intérieures sans fix GPS autorisées (position 0.00000).
+Entrée : `SD.end()` + `carteSdOk = false` → la carte peut être retirée ou changée ; le prochain
+enregistrement (retour en standard) refait `SD.begin()` dans `GetFile` avant toute écriture,
+pour ne jamais réutiliser le volume FAT en cache sur une autre carte.
 Boucle infinie :
 
 - rouge long → `« Retour en mode standard »`, `modeActuel=STANDARD`, `sansPositionOk=false`, return.
@@ -204,15 +210,15 @@ Plan EEPROM : `0: magic uint16 0xACAB`, `2: VERSION (1)`, `3: NUMERO_LOT (1)`,
 
 ## 7. Boutons poussoirs (anti-rebond + appui long)
 
-Structure volatile `EtatBouton { pin, enfonce, appui, appuiLong, longSignale, derniereModif, debut }`
-pour `boutonRouge` (D2) / `boutonVert` (D3).
+Structure `EtatBouton { pin, enfonce, appui, appuiLong, longSignale, derniereModif, debut, evenement }`
+pour `boutonRouge` (D2, INT0) / `boutonVert` (D3, INT1).
 
 - `InitBoutons()` : `INPUT_PULLUP`, capture états initiaux, `debut/derniereModif = millis()`,
-  Timer1 CTC : `TCCR1A=0, TCCR1B=WGM12|CS11|CS10 (prescaler 64), OCR1A=249, TIMSK1=OCIE1A`
-  → ISR à 1 kHz (16 MHz / 64 / 250).
-- `ISR(TIMER1_COMPA_vect)` : `ScannerBouton()` sur les 2 boutons avec `millis()`.
-- `ScannerBouton()` : `niveau = digitalRead == LOW` ; si changement et
-  `maintenant-derniereModif >= ANTI_REBOND_MS (30)` → met à jour, sur front descendant
+  `attachInterrupt(..., CHANGE)` sur D2 et D3. Pas de Timer1.
+- ISR `InterruptionBoutonRouge/Vert()` : pose seulement `evenement = true`.
+- `ActualiserBouton()` (appelée par les accesseurs `Bouton*` et par `PompeGps()`) :
+  prise atomique de `evenement` ; si `maintenant-derniereModif >= ANTI_REBOND_MS (30)` et
+  niveau modifié (`digitalRead == LOW`) → met à jour, sur front descendant
   `appui=true, debut=maintenant, appuiLong=false, longSignale=false`.
   Si `enfonce && !longSignale && maintenant-debut >= DUREE_APPUI_LONG (5000)` →
   `appuiLong=true, longSignale=true` (une seule fois par pression).
@@ -335,11 +341,11 @@ en `double` mais stockés via `float LesKordonnesGps[2]`, `MaxFileSize` global i
 
 | Ressource | Valeur | Remarque |
 |---|---|---|
-| RAM statique (.data + .bss + .noinit) | 1595 / 2048 o (78 %) | 1787 o avant les corrections (§13.4) |
-| Pile libre au boot | ~337 o | mesuré par le diagnostic (§13.3) |
+| RAM statique (.data + .bss + .noinit) | 1599 / 2048 o (78 %) | `uno` : 1601 o. 1787 o avant les corrections (§13.4) |
+| Pile libre au boot | ~337 o | mesuré par le diagnostic (§13.3), non remesuré après §14 |
 | Pile libre minimale (cycle de mesure) | **17 o** | pic pendant l'écriture SD : marge trop faible |
 | Tas maximal | 44 o | BME280 (4 `new` dans `begin()`), SD (1 `malloc` par `SD.open`) |
-| Flash | 99,1 % (~300 o libres) | `uno` : 99,4 % |
+| Flash | 99,3 % (~214 o libres) | `uno` : 99,6 % (~116 o libres) |
 
 La pile et le tas partagent la même zone de RAM (entre la fin de la RAM statique et
 `RAMEND`), sans garde : un débordement n'est pas signalé, il corrompt la mémoire
@@ -383,3 +389,26 @@ La pile et le tas partagent la même zone de RAM (entre la fin de la RAM statiqu
   - bornes min/max des paramètres déplacées en `PROGMEM` (`LesBornes`) : −112 o de RAM ;
   - tampons série réduits à 32 o (RX) et 16 o (TX) : −82 o de RAM.
 - Résultat : boucle non reproduite sur 200 s de fonctionnement. Marge de pile encore faible (17 o).
+
+---
+
+## 14. Conformité au cahier des charges (4 modes)
+
+Conforme :
+- Démarrage sans bouton → STANDARD ; bouton rouge tenu au démarrage → CONFIG.
+- CONFIG : paramètres configurables en série, acquisition capteurs désactivée.
+- CONFIG → STANDARD : appui long rouge 5 s, et **30 min sans saisie série** (ajouté).
+- STANDARD → ECO : appui long vert 5 s. ECO → STANDARD : appui long rouge 5 s.
+- STANDARD → MAINTENANCE : appui long rouge 5 s. MAINTENANCE → STANDARD : appui long rouge 5 s.
+- MAINTENANCE : données capteurs sur la série, aucune écriture SD ; carte SD réinitialisée
+  au retour en acquisition (ajouté, voir §5.3).
+
+Écarts :
+- **ECO → MAINTENANCE non implémenté (choix retenu).** Le cahier des charges dit que la
+  maintenance est accessible « depuis le mode standard ou économique » (appui rouge 5 s),
+  mais le même document dit qu'en économique l'appui rouge 5 s ramène en standard. Les deux
+  règles utilisent le même geste ; la règle « économique → standard » est conservée. Donc la
+  maintenance n'est accessible que depuis STANDARD, et son « mode précédent » est toujours STANDARD.
+- **Économie d'énergie partielle.** Le GPS n'est pas mis hors tension (aucune broche de
+  commande, SoftwareSerial continue de recevoir) : l'économie se limite à `LOG_INTERVAL x2`
+  et au GPS une mesure sur deux. Le BME280 reste lu à chaque mesure.

@@ -36,6 +36,7 @@
 #define EEPROM_PARAMS 4
 #define ANTI_REBOND_MS 30
 #define DUREE_APPUI_LONG 5000
+#define CONFIG_INACTIVITE_MS 1800000UL // 30 min sans saisie -> retour en standard
  
 TinyGPSPlus gps;
 // latitude gps / longitude gps
@@ -193,6 +194,9 @@ enum ModeFonctionnement
 };
 
 ModeFonctionnement modeActuel = MODE_STANDARD;
+// Instant (millis) de la derniere saisie en configuration : sans saisie
+// pendant CONFIG_INACTIVITE_MS, retour automatique en mode standard.
+unsigned long derniereActiviteConfig = 0;
  
  
 ChainableLED leds(CLK_LED, DATA_LED, LED_COUNT);
@@ -583,6 +587,7 @@ void setup()
   modeActuel = (demandeConfig || BoutonRougePresse() || BoutonRougeAppui()) ? MODE_CONFIG : MODE_STANDARD;
   if (modeActuel == MODE_CONFIG)
   {
+    derniereActiviteConfig = millis();
     Serial.println(F("=CONFIG="));
     Serial.print(F("> "));
     // L'entree en config exigeait ROUGE tenu au reset, mais les inits
@@ -1096,6 +1101,11 @@ void PrintRecord(Record *record)
 void ModeMaintenance()
 {
   sansPositionOk = true;
+  // Carte SD liberee : elle peut etre retiree ou changee sans risque.
+  // carteSdOk=false force un SD.begin() avant le prochain enregistrement
+  // (GetFile), pour ne jamais utiliser le volume FAT en cache sur une autre carte.
+  SD.end();
+  carteSdOk = false;
   while (1)
   {
     if (BoutonRougeAppuiLong())
@@ -1205,6 +1215,7 @@ void ModeConfig()
   static bool haveEqual = false;
   while (Serial.available())
   {
+    derniereActiviteConfig = millis(); // activite : repousse le timeout 30 min
     char caractere = Serial.read();
 
     if (caractere == '\r' || caractere == '\n' || caractere == '\0')
@@ -1344,10 +1355,18 @@ void loop()
   {
   case MODE_CONFIG:
     ModeConfig();
-    // On reste en config jusqu'a un appui long rouge (5 s).
-    if (BoutonRougeAppuiLong())
+    // Sortie : appui long rouge (5 s) ou 30 min sans saisie. L'appui long
+    // est lu en premier pour toujours consommer son evenement.
     {
-      modeActuel = MODE_STANDARD;
+      bool sortie = BoutonRougeAppuiLong();
+      if (millis() - derniereActiviteConfig >= CONFIG_INACTIVITE_MS)
+      {
+        sortie = true;
+      }
+      if (sortie)
+      {
+        modeActuel = MODE_STANDARD;
+      }
     }
     break;
 
