@@ -34,8 +34,6 @@
 #define EEPROM_VERSION 2
 #define EEPROM_LOT 3
 #define EEPROM_PARAMS 4
-// 1 : un lot de 5 enregistrements ne tient pas dans la RAM libre (~100 o)
-#define BATCH_SIZE 1
 #define ANTI_REBOND_MS 30
 #define DUREE_APPUI_LONG 5000
  
@@ -59,6 +57,11 @@ int SumCapteurError = 0;
 // Maintenance en interieur : autorise les mesures sans position GPS
 // (position affichee 0.00000). Les modes normal/eco exigent toujours le GPS.
 bool sansPositionOk = false;
+// Dernier code d'echec de GetNewRecord (0 = ok) : la maintenance l'affiche
+// pour dire QUEL sous-systeme bloque (1=RTC, 2=GPS, 3=BME280, 4=donnee).
+// Le Record est statique, jamais alloue : le tas (~300 o libres) est trop
+// petit pour malloc (SD + pile) et malloc refusait (ex-Echec 7).
+uint8_t codeEchec = 0;
 
 enum ModeFonctionnement
 {
@@ -246,7 +249,8 @@ void InitCapteur()
   }
   if (!ok)
   {
-    Serial.println(F("Erreur : BME280 introuvable !"));
+    // Message detaille inutile : OnImprimeLerreurViaLed(3) signale deja
+    // "Erreur 3 : BME280" + LED (flash a ~100 %, chaque octet compte).
     OnImprimeLerreurViaLed(3);
     return;
   }
@@ -542,6 +546,7 @@ void InitGps()
 
 Record *GetNewRecord(int withGps)
 {
+  codeEchec = 0;
   // Position : fix GPS frais si demandé, sinon dernière position connue.
   // En maintenance interieure (sansPositionOk), on mesure meme sans fix.
   if (withGps)
@@ -589,6 +594,7 @@ Record *GetNewRecord(int withGps)
   if (isnan(temperature) || isnan(pression) || isnan(humidity) || timeoutI2C || duree > timeout)
   {
     SumCapteurError++;
+    codeEchec = 3;
     if (SumCapteurError >= 2)
     {
       OnImprimeLerreurViaLed(3);
@@ -619,11 +625,11 @@ Record *GetNewRecord(int withGps)
   }
 #endif
 
-  Record *record_ptr = (Record *)malloc(sizeof(Record));
-  if (record_ptr == NULL)
-  {
-    return NULL;
-  }
+  // Record statique : un seul enregistrement vivant a la fois
+  // (ecrit sur SD avant la mesure suivante). malloc echouait
+  // systematiquement : tas plein (85 % de RAM statique + pile).
+  static Record leRecord;
+  Record *record_ptr = &leRecord;
   record_ptr->Latitude = LesKordonnesGps[0];
   record_ptr->Longitude = LesKordonnesGps[1];
   record_ptr->Date = maintenant;
@@ -732,68 +738,45 @@ int ValidCapteurData(const __FlashStringHelper *nomMin, const __FlashStringHelpe
   return 0;
 }
  
-struct Record *batch[BATCH_SIZE];
-int SavedBatch = 0;
- 
-// Libere les enregistrements du lot et le vide
-void LibererLot()
-{
-  for (int i = 0; i < SavedBatch; i++)
-  {
-    free(batch[i]);
-  }
-  SavedBatch = 0;
-}
-
-// Ajoute record au lot ; AppendSdCard en prend possession (libere apres ecriture).
-// Le lot est ecrit sur la SD quand il est plein.
+// Ecrit record sur la SD (record statique, valide pendant l'ecriture).
+// Ecriture immediate : un lot ne tient pas en RAM (~100 o libres).
 // 1=error,0=success
 int AppendSdCard(Record *record)
 {
-  batch[SavedBatch] = record;
-  SavedBatch++;
-  if (SavedBatch < BATCH_SIZE)
-  {
-    return 0;
-  }
-
   File fichier;
-  if (!GetFile(&batch[SavedBatch - 1]->Date, fichier))
+  if (!GetFile(&record->Date, fichier))
   {
-    LibererLot();
     return 1;
   }
-  for (int i = 0; i < SavedBatch; i++)
+  char buffer[64];
+  char *p = buffer;
+  p = FormatDecimal(record->Latitude, 6, p);
+  *p++ = ';';
+  p = FormatDecimal(record->Longitude, 6, p);
+  *p++ = ';';
+  p = FormatDecimal(record->Temperature, 2, p);
+  *p++ = ';';
+  p = FormatDecimal(record->Humidity, 2, p);
+  *p++ = ';';
+  p = FormatDecimal(record->Pressure, 2, p);
+  *p++ = '\n';
+  *p = '\0';
+  size_t longueur = p - buffer;
+  if (fichier.write((const uint8_t *)buffer, longueur) != longueur)
   {
-    char buffer[64];
-    char *p = buffer;
-    p = FormatDecimal(batch[i]->Latitude, 6, p);
-    *p++ = ';';
-    p = FormatDecimal(batch[i]->Longitude, 6, p);
-    *p++ = ';';
-    p = FormatDecimal(batch[i]->Temperature, 2, p);
-    *p++ = ';';
-    p = FormatDecimal(batch[i]->Humidity, 2, p);
-    *p++ = ';';
-    p = FormatDecimal(batch[i]->Pressure, 2, p);
-    *p++ = '\n';
-    *p = '\0';
-    size_t longueur = p - buffer;
-    if (fichier.write((const uint8_t *)buffer, longueur) != longueur)
-    {
-      OnImprimeLerreurViaLed(6);
-    }
+    OnImprimeLerreurViaLed(6);
   }
   fichier.close();
-  LibererLot();
   return 0;
 }
  
 
 // Affiche une ligne du tableau. libelle est en flash (F("...")).
+// Tampon 40 o : ligne max "| "+12+" : "+19+" |" = 38 car. + '\0'.
+// (64 o + PrintRecord imbrique debordaient de la pile : RAM corrompue.)
 void AfficheLigne(const __FlashStringHelper *libelle, const char *valeur)
 {
-  char ligne[64];
+  char ligne[40];
   snprintf_P(ligne, sizeof(ligne), PSTR("| %-12S : %-19s |"), (PGM_P)libelle, valeur);
   Serial.println(ligne);
 }
@@ -814,43 +797,42 @@ void PrintRecord(Record *record)
   snprintf_P(date, sizeof(date), PSTR("%02d/%02d/%04d %02d:%02d:%02d"),
            record->Date.day(), record->Date.month(), record->Date.year(),
            record->Date.hour(), record->Date.minute(), record->Date.second());
- 
-  char latitude[16];
-  char longitude[16];
-  char temperature[16];
-  char humidite[16];
-  char pression[16];
- 
-  FormatDecimal(record->Latitude, 5, latitude);
-  FormatDecimal(record->Longitude, 5, longitude);
- 
+
+  // UN SEUL tampon valeur reutilise ligne par ligne (date=19, autres<=12) :
+  // 5 tampons separes + AfficheLigne imbrique depassaient la pile libre
+  // (~269 o) et corrompaient la RAM (flot d'octets illisibles sur serie).
+  char val[20];
+
+  AfficheLigne(F("Date"), date);
+
+  FormatDecimal(record->Latitude, 5, val);
+  AfficheLigne(F("Latitude"), val);
+  FormatDecimal(record->Longitude, 5, val);
+  AfficheLigne(F("Longitude"), val);
+
   // Ajout manuel de l'unite (evite strcat_P pour economiser la flash).
   // FormatDecimal renvoie la fin de chaine, on s'en sert directement.
   char *fin;
-  fin = FormatDecimal(record->Temperature, 2, temperature);
+  fin = FormatDecimal(record->Temperature, 2, val);
   *fin++ = ' ';
   *fin++ = 'C';
   *fin = '\0';
+  AfficheLigne(F("Temperature"), val);
 
-  fin = FormatDecimal(record->Humidity, 2, humidite);
+  fin = FormatDecimal(record->Humidity, 2, val);
   *fin++ = ' ';
   *fin++ = '%';
   *fin = '\0';
+  AfficheLigne(F("Humidite"), val);
 
-  fin = FormatDecimal(record->Pressure, 2, pression);
+  fin = FormatDecimal(record->Pressure, 2, val);
   *fin++ = ' ';
   *fin++ = 'h';
   *fin++ = 'P';
   *fin++ = 'a';
   *fin = '\0';
+  AfficheLigne(F("Pression"), val);
 
-  AfficheLigne(F("Date"), date);
-  AfficheLigne(F("Latitude"), latitude);
-  AfficheLigne(F("Longitude"), longitude);
-  AfficheLigne(F("Temperature"), temperature);
-  AfficheLigne(F("Humidite"), humidite);
-  AfficheLigne(F("Pression"), pression);
- 
   Serial.println();
 }
  
@@ -874,11 +856,15 @@ void ModeMaintenance()
     if (record != NULL)
     {
       PrintRecord(record);
-      free(record);
     }
     else
     {
-      Serial.println(F("Echec mesure"));
+      // Precise QUEL sous-systeme bloque (1=RTC, 2=GPS, 3=BME280,
+      // 4=donnee incoherente). Chiffre via Serial.write('0'+code)
+      // car print(int) tirerait ~200 o de division logicielle sur AVR.
+      Serial.print(F("Echec "));
+      Serial.write('0' + codeEchec);
+      Serial.println();
     }
     for (int i = 0; i < 100; i++)
     {
@@ -897,7 +883,7 @@ void ModeNormalOrEco(bool ecoMode)
  
   while (1)
   {
-    // AppendSdCard prend possession du record : ne pas le liberer ici
+    // Record statique : rien a liberer ici
     Record *record_ptr = GetNewRecord(shouldDoGPS);
     if (record_ptr != NULL && AppendSdCard(record_ptr) > 0)
     {
@@ -1028,6 +1014,7 @@ void ModeConfig()
 // Factorise en un seul Serial.println + un seul ClignoteLed (flash pleine).
 void OnImprimeLerreurViaLed(int mode)
 {
+  codeEchec = (uint8_t)mode;
   Serial.print(F("Erreur "));
   Serial.print(mode);
   const __FlashStringHelper *msg = NULL;
@@ -1059,7 +1046,7 @@ void OnImprimeLerreurViaLed(int mode)
     d2 = 667;
     break;
   case 6:
-    msg = F(" : carte SD pleine");
+    msg = F(" : SD pleine");
     break;
   default:
     break;

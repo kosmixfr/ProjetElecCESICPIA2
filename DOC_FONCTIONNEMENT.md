@@ -138,7 +138,7 @@ Contrôles `< ' '` ignorés sans echo (flèches ESC, etc.). Echo manuel par
   1 mesure sur 2 pour économiser l'énergie.
 - Boucle infinie :
   1. `record = GetNewRecord(shouldDoGPS)` ; si non-NULL, `AppendSdCard(record)`
-     **prend possession** (ne pas `free` ici). Si `AppendSdCard > 0` (erreur fichier)
+      (record statique, écrit aussitôt). Si `AppendSdCard > 0` (erreur fichier)
      → retour `MODE_STANDARD` (en pratique on reste, `loop()` relance).
   2. Attente `intervalle` par tranches de 10 ms avec `PompeGps()` (drain buffer GPS 64 o)
      et scrutation boutons :
@@ -151,9 +151,11 @@ Contrôles `< ' '` ignorés sans echo (flèches ESC, etc.). Echo manuel par
 Boucle infinie :
 
 - rouge long → `« Retour en mode standard »`, `modeActuel=STANDARD`, `sansPositionOk=false`, return.
-- `record = GetNewRecord(true)` ; si non-NULL → `PrintRecord(record)` + `free(record)`.
-  Si NULL (erreur déjà signalée par `Erreur N`), affiche `Echec mesure`
-  (preuve de vie : sans ça un capteur muet donnait un silence total).
+- `record = GetNewRecord(true)` ; si non-NULL → `PrintRecord(record)`.
+  Si NULL, affiche `Echec N` où `N` = `codeEchec`, le sous-système en faute :
+  `1`=RTC, `2`=GPS, `3`=BME280, `4`=donnée incohérente.
+  (Le `Record` est statique : plus de `malloc`, qui refusait — ex-`Echec 7` —
+  car le tas n'a pas ~30 o libres avec 85 %+ de RAM statique.)
 - `100 x { PompeGps(); delay(10); }` ≈ 1 s entre affichages tout en nourrissant le GPS.
 
 `PrintRecord()` : tableau série `| Date : ... |`, `Latitude`, `Longitude`,
@@ -221,8 +223,8 @@ déjà tenu pendant le reset.
 ## 8. Acquisition `GetNewRecord(int withGps)` → `Record*` ou `NULL`
 
 `Record { double Latitude, Longitude ; DateTime Date ; float Temperature, Humidity, Pressure }`,
-alloué par `malloc(sizeof(Record))` (appelant propriétaire, `free` après usage
-sauf via `AppendSdCard` qui prend possession).
+en `static` dans `GetNewRecord` (jamais `malloc`/`free` : le tas (~300 o libres
+moins la pile) est trop petit — `malloc` refusait systématiquement).
 
 1. **GPS** si `withGps` : `PompeGps()` (draine `gpsSerial` → `gps.encode()`),
    si `gps.location.isValid()` → maj `LesKordonnesGps[2]` (`float[2]`, initialisé à 0).
@@ -237,7 +239,7 @@ sauf via `AppendSdCard` qui prend possession).
    somme > 0 → **erreur 4**, `NULL`.
 4. **Horodatage** : `SANS_RTC ? GenererDateSansRtc() : rtc_clock.now()` avec
    contrôle timeout I2C → **erreur 1**, `NULL`.
-5. `malloc`, remplit champs, retourne pointeur.
+5. Remplit le `Record` statique, retourne son pointeur (toujours valide).
 
 ---
 
@@ -247,12 +249,11 @@ sauf via `AppendSdCard` qui prend possession).
   `sprintf_P("%02d%02d%02d_%d.LOG", yy, mm, dd, i)`, ouvre `FILE_WRITE`,
   retourne le premier dont `size() < FILE_MAX_SIZE`. Échec open → **erreur 5**+`false` ;
   les 10 pleins → **erreur 6**+`false`.
-- `AppendSdCard(Record*)` : `batch[SavedBatch++]=record` (`BATCH_SIZE=1`,
-  lot de 1 car 5 enregistrements ne tiennent pas en RAM libre ~100 o).
-  Quand plein : `GetFile(date du dernier)`, pour chaque entrée formate
+- `AppendSdCard(Record*)` : écriture immédiate (pas de lot : ~100 o de RAM
+  libre interdisent un lot de 5). `GetFile(date du record)`, formate
   `lat(6);lon(6);temp(2);humi(2);press(2)\n` (buffer 64 o, `FormatDecimal`,
   `;` et `\n` manuels) puis `fichier.write()`. Échec partiel → **erreur 6**.
-  `close()` puis `LibererLot()` (`free` chaque + `SavedBatch=0`). Retour `1=erreur, 0=ok`.
+  `close()`. Retour `1=erreur, 0=ok`.
 - `FormatDecimal(float v, uint8_t decimales, char *out)` : écrit sans `%f`
   (printf flottant désactivé pour la flash), arrondi `+0.5`, bourrage zéros
   fractionnaires, retourne fin de chaîne (pratique pour ajouter ` C`, ` %`, ` hPa`).
@@ -280,7 +281,13 @@ pour éviter une spécialisation par constantes (~250 o chacune).
 | 3 | capteur BME280 | rouge / vert 500/500 |
 | 4 | donnée capteur incohérente | rouge / vert 333/667 |
 | 5 | accès carte SD | rouge / blanc 333/667 |
-| 6 | carte SD pleine | rouge / blanc 500/500 |
+| 6 | SD pleine | rouge / blanc 500/500 |
+
+`codeEchec` (RAM, `GetNewRecord` + `OnImprimeLerreurViaLed`) mémorise le dernier
+code (1–4, 6 ci-dessus ; le `7` = `malloc` refusé a disparu avec le `Record`
+statique) ; la maintenance affiche `Echec N` à chaque mesure ratée pour dire
+quel sous-système bloque
+(raccourci `6` en `SD pleine` : flash à ~100 %, chaque octet compte).
 
 ---
 
@@ -290,8 +297,12 @@ Flash saturée → chaque octet compte (`platformio.ini`, commentaires code) :
 `-flto -Os -mcall-prologues`, `F()`/`PSTR`/`sprintf_P`/`snprintf_P`/`strcmp_P` partout,
 noms paramètres en `PROGMEM`, `FormatDecimal` maison, parsing entier manuel
 (au lieu de `strtol`), `noinline,noclone` LED, pas de `String` Arduino,
-`Wire.setWireTimeout(25 ms, reset auto)`, buffers série statiques 16 o, `BATCH_SIZE=1`,
-pas de scan I2C au boot, messages GPS réduits.
+ni de `malloc`/`free` (record statique : le tas est trop petit),
+`Wire.setWireTimeout(25 ms, reset auto)`, buffers série statiques 16 o,
+écriture SD immédiate (pas de lot), pas de scan I2C au boot, messages GPS réduits.
+`PrintRecord` réutilise un seul tampon valeur 20 o + `AfficheLigne` 40 o
+(184 o imbriqués dépassaient les ~270 o de pile libre et corrompaient la RAM
+— flot d'octets illisibles sur la série).
 
 ---
 
