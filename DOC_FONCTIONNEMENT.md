@@ -5,7 +5,7 @@ Mesure température / humidité / pression (BME280), horodate (RTC DS1307),
 localise (GPS), stocke sur carte SD, signale par LED RGB et 2 boutons,
 configurable par liaison série.
 
-Fichiers : `src/main.cpp` (~1390 lignes), `src/main.h` (paramètres + `Record`),
+Fichiers : `src/main.cpp` (~1255 lignes), `src/main.h` (paramètres + `Record`),
 `platformio.ini` (2 environnements).
 
 ---
@@ -341,11 +341,11 @@ en `double` mais stockés via `float LesKordonnesGps[2]`, `MaxFileSize` global i
 
 | Ressource | Valeur | Remarque |
 |---|---|---|
-| RAM statique (.data + .bss + .noinit) | 1599 / 2048 o (78 %) | `uno` : 1601 o. 1787 o avant les corrections (§13.4) |
-| Pile libre au boot | ~337 o | mesuré par le diagnostic (§13.3), non remesuré après §14 |
-| Pile libre minimale (cycle de mesure) | **17 o** | pic pendant l'écriture SD : marge trop faible |
+| RAM statique (.data + .bss + .noinit) | 1590 / 2048 o (78 %) | `uno` : 1592 o. 1787 o avant les corrections (§13.4) |
+| Pile libre au boot | ~337 o | mesure historique (diagnostic §13.3 retiré) |
+| Pile libre minimale (cycle de mesure) | **17 o** | mesure historique, pic pendant l'écriture SD : marge trop faible |
 | Tas maximal | 44 o | BME280 (4 `new` dans `begin()`), SD (1 `malloc` par `SD.open`) |
-| Flash | 99,3 % (~214 o libres) | `uno` : 99,6 % (~116 o libres) |
+| Flash | 97,6 % (~762 o libres) | `uno` : 97,9 % (~664 o libres) |
 
 La pile et le tas partagent la même zone de RAM (entre la fin de la RAM statique et
 `RAMEND`), sans garde : un débordement n'est pas signalé, il corrompt la mémoire
@@ -360,24 +360,28 @@ La pile et le tas partagent la même zone de RAM (entre la fin de la RAM statiqu
 4. Pas de `String`, pas de `new`/`malloc` pour nos propres objets, pas de `sprintf`/`printf` flottant.
 5. Ne pas ré-augmenter les tampons série (`SERIAL_*_BUFFER_SIZE`, §2) sans mesurer la marge.
 6. Après chaque ajout : compiler `uno_sans_rtc` et `uno`, reporter RAM et flash ci-dessus,
-   puis mesurer la marge de pile (§13.3) sur un run de plusieurs minutes.
+   puis mesurer la marge de pile sur un run de plusieurs minutes (réintroduire
+   temporairement le diagnostic §13.3, retiré du code, pour la mesure).
 7. Seuil proposé (à valider) : au moins 50 o de pile libre mesurée. En dessous, ne pas
    ajouter de fonctionnalité sur le chemin de mesure avant d'avoir libéré de la RAM.
 
-### 13.3 Diagnostic temporaire (à retirer)
+### 13.3 Diagnostic temporaire (retiré)
 
-- Code marqué « DIAGNOSTIC RESET » dans `src/main.cpp` : `diag` (en `.noinit`, conservé au reset),
-  `DiagPeintPile` (peint la RAM libre en `0xAA` au boot), `DiagPileLibre` / `DiagTasUtilise`,
-  `Etape(n)`, `DiagDemarrage`.
-- Sortie série à chaque repère : `E<étape> <pile libre> <tas max>`.
-  Étapes : `1` setup, `A` avant RTC, `B` avant capteur, `C` avant SD, `D` avant EEPROM,
-  `2` avant GPS, `3` début de mesure, `4` BME280, `5` horodatage, `6` ouverture SD,
-  `7` écriture SD, `8` attente entre mesures.
-- Au reset, la ligne `Reset: etape N pile min M` donne la dernière étape et la pile minimale
-  du run précédent. Si la RAM a été corrompue, elle affiche `diag absent` ou une valeur incohérente.
-- La pile libre est mesurée depuis le sommet maximal du tas : les blocs libérés ne faussent pas la mesure.
-- Coût : ~11 o de RAM, ~400 o de flash, et des sorties série à chaque repère (ralentissent la boucle).
-  À retirer avant de figer une version.
+Le diagnostic « DIAGNOSTIC RESET » (disponible dans l'historique git, commit « Refactor memory
+management... ») a été retiré une fois le reset identifié et corrigé (§13.4). Il est à
+réintroduire temporairement pour toute campagne de mesure de pile.
+
+Ce qu'il faisait :
+- `diag` (en `.noinit`, conservé au reset), `DiagPeintPile` (peignait la RAM libre en `0xAA` au boot),
+  `DiagPileLibre` / `DiagTasUtilise`, `Etape(n)`, `DiagDemarrage`.
+- Sortie série à chaque repère : `E<étape> <pile libre> <tas max>` (ces lignes polluaient
+  le mode normal). Étapes : `1` setup, `A` avant RTC, `B` avant capteur, `C` avant SD,
+  `D` avant EEPROM, `2` avant GPS, `3` début de mesure, `4` BME280, `5` horodatage,
+  `6` ouverture SD, `7` écriture SD, `8` attente entre mesures.
+- Au reset, la ligne `Reset: etape N pile min M` donnait la dernière étape et la pile minimale
+  du run précédent. Si la RAM avait été corrompue, elle affichait `diag absent` ou une valeur incohérente.
+- La pile libre était mesurée depuis le sommet maximal du tas : les blocs libérés ne faussaient pas la mesure.
+- Coût : ~9 o de RAM, ~550 o de flash, et des sorties série à chaque repère (ralentissaient la boucle).
 
 ### 13.4 Historique : boucle de reset « Lancement / ModeNormal »
 

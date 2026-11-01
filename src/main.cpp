@@ -68,123 +68,6 @@ uint8_t codeEchec = 0;
 // un bus mort (pics de courant -> brown-out + "Lancement" en boucle).
 bool carteSdOk = false;
 
-// --- DIAGNOSTIC RESET (temporaire : a retirer une fois le reset trouve) ---
-// Variable en .noinit : non reinitialisee au reset, donc conservee d'un reset
-// a l'autre. Au boot suivant, setup() affiche la derniere etape atteinte et la
-// pile libre minimale mesuree avant le reset.
-#define DIAG_MAGIC 0xD1A6
-struct DiagReset
-{
-  uint16_t magic;
-  uint8_t etape;
-  uint16_t pileMin;
-};
-static DiagReset diag __attribute__((section(".noinit")));
-// Symboles fournis par l'edition de liens AVR (debut du tas, fin du tas)
-extern int __heap_start, *__brkval;
-static char *diagDebut = 0;
-static char *diagFin = 0;
-// Sommet maximal du tas atteint depuis le boot (adresse) : les blocs liberes
-// redescendent __brkval mais leurs anciennes donnees ne sont pas de la pile.
-static uint16_t diagTasMax = 0;
-
-// Peint la RAM libre (au-dessus du tas, sous la pile) avec 0xAA.
-// La pile qui descend ecrit dessus : la premiere case modifiee donne le
-// point le plus bas atteint (tas compris). Marge de 64 o sous le cadre.
-__attribute__((noinline)) static void DiagPeintPile()
-{
-  char *debut = (char *)(__brkval == 0 ? (int)&__heap_start : (int)__brkval);
-  char marque;
-  char *fin = &marque - 64;
-  for (char *p = debut; p < fin; p++)
-  {
-    *p = (char)0xAA;
-  }
-  diagDebut = debut;
-  diagFin = fin;
-  diagTasMax = (uint16_t)(int)debut;
-  diag.pileMin = (uint16_t)(fin - debut);
-}
-
-// Pile libre = octets intacts entre le sommet du tas (malloc) et la pile.
-// Compte depuis __brkval : le tas (BME280 'new', SD 'malloc') ecrit sous
-// son sommet et ne doit pas etre compte comme pile.
-static uint16_t DiagTasBase()
-{
-  return (uint16_t)(__brkval == 0 ? (int)&__heap_start : (int)__brkval);
-}
-
-__attribute__((noinline)) static uint16_t DiagPileLibre()
-{
-  uint16_t base = DiagTasBase();
-  if (base > diagTasMax)
-  {
-    diagTasMax = base;
-  }
-  char *tas = (char *)diagTasMax;
-  char *p = tas;
-  while (p < diagFin && (uint8_t)*p == 0xAA)
-  {
-    p++;
-  }
-  return (uint16_t)(p - tas);
-}
-
-// Tas maximal utilise (octets depuis le debut du tas). A appeler apres DiagPileLibre.
-static uint16_t DiagTasUtilise()
-{
-  return (uint16_t)(diagTasMax - (uint16_t)(int)&__heap_start);
-}
-
-static void AfficheNombre(uint16_t n);
-
-// Repere l'etape courante (0 = setup), garde la pile libre minimale et
-// l'affiche : chaque ligne "E<etape> <pile>" precede un eventuel crash.
-static void Etape(uint8_t e)
-{
-  diag.etape = e;
-  uint16_t libre = DiagPileLibre();
-  if (libre < diag.pileMin)
-  {
-    diag.pileMin = libre;
-  }
-  Serial.write('E');
-  Serial.write((char)(e < 10 ? '0' + e : 'A' + (e - 10)));
-  Serial.write(' ');
-  AfficheNombre(libre);
-  Serial.write(' ');
-  AfficheNombre(DiagTasUtilise());
-  Serial.println();
-}
-
-static void AfficheNombre(uint16_t n)
-{
-  if (n >= 10)
-  {
-    AfficheNombre(n / 10);
-  }
-  Serial.write((char)('0' + n % 10));
-}
-
-// Affiche l'etape et la pile minimale du reset precedent, puis reinitialise.
-static void DiagDemarrage()
-{
-  if (diag.magic == DIAG_MAGIC)
-  {
-    Serial.print(F("Reset: etape "));
-    Serial.write((char)('0' + diag.etape));
-    Serial.print(F(" pile min "));
-    AfficheNombre(diag.pileMin);
-    Serial.println();
-  }
-  else
-  {
-    Serial.println(F("Reset: diag absent"));
-  }
-  diag.magic = DIAG_MAGIC;
-  diag.etape = 0;
-}
-
 enum ModeFonctionnement
 {
   MODE_CONFIG,
@@ -551,9 +434,6 @@ void setup()
 {
   Serial.begin(9600);
   Serial.println(F("Lancement"));
-  DiagDemarrage();
-  DiagPeintPile();
-  Etape(1);
 
   // I2C en premier : le timeout court + SoftwareSerial actif perturbaient
   // les init RTC/BME (timeout 1 ms, flag jamais efface).
@@ -570,18 +450,13 @@ void setup()
   InitLed();
   // Pas de scan I2C ici : 242 o de flash economises (projet a ~99.9 %).
   // Un probleme I2C remonte de toute facon via les erreurs 1 (RTC) et 3 (BME280).
-  Etape(10); // 'A' : avant InitRtc
   InitRtc();
-  Etape(11); // 'B' : avant InitCapteur
   InitCapteur();
-  Etape(12); // 'C' : avant InitSd
   InitSd();
-  Etape(13); // 'D' : avant InitEeprom
   InitEeprom();
 
   // GPS en dernier : SoftwareSerial bavard fausse les timings I2C,
   // et l'ancien InitGps bloquait tout sans fix.
-  Etape(2);
   InitGps();
 
   modeActuel = (demandeConfig || BoutonRougePresse() || BoutonRougeAppui()) ? MODE_CONFIG : MODE_STANDARD;
@@ -643,7 +518,6 @@ char *FormatDecimal(float v, uint8_t decimales, char *out)
 // false=erreur
 bool GetFile(DateTime *date, File &fichier)
 {
-  Etape(6);
   // Carte tombee ou reinseree apres le boot : une seule retentative
   // (pas de boucle serree -> pics de courant -> reset "Lancement").
   if (!carteSdOk)
@@ -744,7 +618,6 @@ void InitGps()
 
 Record *GetNewRecord(int withGps)
 {
-  Etape(3);
   codeEchec = 0;
   // Position : fix GPS frais si demandé, sinon dernière position connue.
   // En maintenance interieure (sansPositionOk), on mesure meme sans fix.
@@ -783,7 +656,6 @@ Record *GetNewRecord(int withGps)
   unsigned long timeout = (unsigned long)GetParam(F("TIMEOUT"))->Value * 1000UL;
   unsigned long debut = millis();
   Wire.clearWireTimeoutFlag();
-  Etape(4);
   float temperature = capteur.readTemperature();
   float pression = capteur.readPressure() / 100.0f;
   float humidity = capteur.readHumidity();
@@ -808,7 +680,6 @@ Record *GetNewRecord(int withGps)
     return NULL;
   }
 
-  Etape(5);
   DateTime maintenant;
 #ifdef SANS_RTC
   maintenant = GenererDateSansRtc();
@@ -953,7 +824,6 @@ int AppendSdCard(Record *record)
   // Ecriture morceau par morceau avec un seul champ[12] : buffer[48/64]
   // + File + SD depassait la pile (~270 o libres) -> "Mo?" + reset.
   // champ[12] suffit : plus grand champ "-180.123456" = 11 + '\0' = 12.
-  Etape(7);
   char champ[12];
   char *fin;
   bool ok = true;
@@ -1166,7 +1036,6 @@ void ModeNormalOrEco(bool ecoMode)
       AppendSdCard(record_ptr);
     }
 
-    Etape(8);
     unsigned long debut = millis();
     while (millis() - debut < intervalle)
     {
