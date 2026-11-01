@@ -5,7 +5,7 @@ Mesure température / humidité / pression (BME280), horodate (RTC DS1307),
 localise (GPS), stocke sur carte SD, signale par LED RGB et 2 boutons,
 configurable par liaison série.
 
-Fichiers : `src/main.cpp` (~1255 lignes), `src/main.h` (paramètres + `Record`),
+Fichiers : `src/main.cpp` (~1275 lignes), `src/main.h` (paramètres + `Record`),
 `platformio.ini` (2 environnements).
 
 ---
@@ -125,6 +125,12 @@ Contrôles `< ' '` ignorés sans echo (flèches ESC, etc.). Echo manuel par
   ~500 o), vérifie `[MinValue, MaxValue]` → `« Commande inconnu »`,
   `« Nombre invalide »`, `« Valeur out of bound !! »` ou `NULL` = succès.
   En succès : `SaveEepromParameters()` + `« OK »`. Affiche `> ` après chaque ligne.
+- Commandes spéciales (`CommandeSpeciale`, seulement si le nom n'est pas un paramètre) :
+  `RESET` remet les 15 paramètres à `LesDefauts` (flash) puis `OK` ;
+  `VERSION` affiche `VERSION <v> lot <n>` puis `OK`.
+  `CLOCK`, `DATE`, `DAY` **ne sont pas implémentés** : la conversion
+  date ↔ horodatage de RTClib coûtait ~830 o de flash alors qu'il n'en restait
+  que ~430 (§13.1) ; ces commandes répondent `Commande inconnu`.
 - Sortie testée par `loop()` : `BoutonRougeAppuiLong()` ou 30 min sans saisie
   (`millis() - derniereActiviteConfig >= CONFIG_INACTIVITE_MS`) → `MODE_STANDARD`.
   `derniereActiviteConfig` est armé à l'entrée en config (fin de `setup()`) et repoussé
@@ -139,13 +145,15 @@ Contrôles `< ' '` ignorés sans echo (flèches ESC, etc.). Echo manuel par
 `ecoMode=false` = STANDARD (`« ModeNormal »`), `true` = ECO (`« ModeEco »`).
 `sansPositionOk = false` (GPS exigé).
 
-- `intervalle = LOG_INTERVAL(s) * 1000 * (ecoMode ? 2 : 1)`.
+- `intervalle = LOG_INTERVAL(min) * 60000 * (ecoMode ? 2 : 1)` (minutes, cf. §6).
 - `shouldDoGPS = true` ; en ECO on alterne (`shouldDoGPS = !shouldDoGPS`) → GPS frais
   1 mesure sur 2 pour économiser l'énergie.
 - Boucle infinie :
   1. `record = GetNewRecord(shouldDoGPS)` ; si non-NULL, `AppendSdCard(record)`
-      (record statique, écrit aussitôt). Si `AppendSdCard > 0` (erreur fichier)
-     → retour `MODE_STANDARD` (en pratique on reste, `loop()` relance).
+      (record statique, écrit aussitôt). Le code de retour d'`AppendSdCard` n'est
+      volontairement pas utilisé : sur erreur SD (5/6) on passe à l'attente puis on
+      réessaie au cycle suivant (un `return` relançait la boucle en rafale → spam
+      « Erreur 5 » + pics de courant → reset).
   2. Attente `intervalle` par tranches de 10 ms avec `PompeGps()` (drain buffer GPS 64 o)
      et scrutation boutons :
      - vert long + non-eco → `MODE_ECO`, return.
@@ -159,10 +167,11 @@ enregistrement (retour en standard) refait `SD.begin()` dans `GetFile` avant tou
 pour ne jamais réutiliser le volume FAT en cache sur une autre carte.
 Boucle infinie :
 
-- rouge long → `« Retour en mode standard »`, `modeActuel=STANDARD`, `sansPositionOk=false`, return.
+- rouge long → `« Mode standard »` (message série), `modeActuel=STANDARD`, `sansPositionOk=false`, return.
 - `record = GetNewRecord(true)` ; si non-NULL → `PrintRecord(record)`.
   Si NULL, affiche `Echec N` où `N` = `codeEchec`, le sous-système en faute :
-  `1`=RTC, `2`=GPS, `3`=BME280, `4`=donnée incohérente.
+  `1`=RTC, `2`=GPS (une donnée capteur invalide n'est plus une erreur bloquante :
+  elle s'affiche `NA`, cf. §8).
   (Le `Record` est statique : plus de `malloc`, qui refusait — ex-`Echec 7` —
   car le tas n'a pas ~30 o libres avec 85 %+ de RAM statique.)
 - `100 x { PompeGps(); delay(10); }` ≈ 1 s entre affichages tout en nourrissant le GPS.
@@ -175,32 +184,37 @@ Boucle infinie :
 
 ## 6. Paramètres et EEPROM (`main.h`, `InitEeprom`, `SaveEepromParameters`)
 
-14 paramètres en RAM (`Parameters losParametros[14]` : nom + valeur), noms en flash `PROGMEM`.
-Bornes min/max dans `LesBornes[14]` (`main.h`), en `PROGMEM` : lues par `BorneMin(i)` /
-`BorneMax(i)` (même ordre que `losParametros`). Ne pas remettre les bornes en RAM (§13).
+15 paramètres en RAM (`Parameters losParametros[15]` : nom + valeur), noms en flash `PROGMEM`.
+Bornes min/max dans `LesBornes[15]` (`main.h`), en `PROGMEM` : lues par `BorneMin(i)` /
+`BorneMax(i)` (même ordre que `losParametros`). Valeurs par défaut dans `LesDefauts[15]`
+(`PROGMEM`), utilisées par la commande `RESET`. Ne pas remettre ces tables en RAM (§13).
 (`NOM_*`, 13 car. max) lus par `strcmp_P`.
 
 | Param | Défaut | Min–Max | Rôle |
 |---|---|---|---|
-| `LOG_INTERVAL` | 10 | 1–1440 | période mesure (s, x2 en ECO) |
+| `LOG_INTERVAL` | 10 | 1–1440 | période mesure en **minutes** (x2 en ECO) |
 | `TIMEOUT` | 30 | 1–255 | durée max lecture BME (interprétée en s dans le code : `*1000`) |
 | `FILE_MAX_SIZE` | 2048 | 1–65535 | taille max fichier LOG (octets) |
-| `LUMIN` | 1 | 0–1 | (réservé, non exploité) |
+| `LUMIN` | 1 | 0–1 | (réservé : pas de capteur de luminosité) |
 | `LUMIN_LOW` | 255 | 0–1023 | (réservé) |
 | `LUMIN_HIGH` | 768 | 0–1023 | (réservé) |
-| `TEMP_AIR` | 1 | 0–1 | (activation, non exploité) |
+| `TEMP_AIR` | 1 | 0–1 | 0 → température écrite `NA` |
 | `MIN_TEMP_AIR` | -10 | -40–85 | borne basse température (°C) |
 | `MAX_TEMP_AIR` | 60 | -40–85 | borne haute température |
-| `HYGR` | 1 | 0–1 | (activation) |
+| `HYGR` | 1 | 0–1 | 0 → humidité écrite `NA` |
 | `HYGR_MINT` | 0 | -40–85 | borne basse humidité (%) |
 | `HYGR_MAXT` | 50 | -40–85 | borne haute humidité |
-| `PRESSURE_MIN` | 800 | 300–1100 | borne basse pression (hPa) |
-| `PRESSURE_MAX` | 1100 | 300–1100 | borne haute pression |
+| `PRESSURE` | 1 | 0–1 | 0 → pression écrite `NA` |
+| `PRESSURE_MIN` | 850 | 300–1100 | borne basse pression (hPa) |
+| `PRESSURE_MAX` | 1080 | 300–1100 | borne haute pression |
 
-Plan EEPROM : `0: magic uint16 0xACAB`, `2: VERSION (1)`, `3: NUMERO_LOT (1)`,
-`4+: 14 x long` (params).
+Plan EEPROM : `0: magic uint16 0xACAB`, `2: VERSION (2)`, `3: NUMERO_LOT (1)`,
+`4+: 15 x long` (params).
 
-- Premier boot (`magic != 0xACAB`) : écrit magic + version + lot + `SaveEepromParameters()`.
+- Premier boot (`magic != 0xACAB`) **ou version différente** : écrit magic + version + lot
+  + `SaveEepromParameters()` (donc les valeurs par défaut de `losParametros`).
+  La version 2 correspond au plan à 15 paramètres : une EEPROM de la version 1
+  (14 paramètres) est ainsi réinitialisée une fois au lieu d'être relue de travers.
 - Sinon : réécrit version/lot, relit chaque `long` et n'adopte que si dans `[Min,Max]`.
 - `GetParam(const char*)` : recherche `strcmp_P` ; surcharge
   `GetParam(const __FlashStringHelper*)` copie le nom flash en tampon RAM 16 o
@@ -245,12 +259,17 @@ moins la pile) est trop petit — `malloc` refusait systématiquement).
    `temperature=readTemperature()`, `pression=readPressure()/100 (Pa→hPa)`,
    `humidity=readHumidity()`, `timeoutI2C=getWireTimeoutFlag()`, `duree=millis()-debut`.
    Si `isnan(...) || timeoutI2C || duree > TIMEOUT*1000` → `SumCapteurError++`,
-   si `>=2` → **erreur 3**, `NULL`. Sinon `SumCapteurError=0` (2 échecs consécutifs exigés).
+   si `>=2` → **erreur 3** ; les trois mesures passent à `NAN` (→ `NA` dans le
+   log) et **l'enregistrement continue** (le cahier des charges demande `NA`, pas
+   la perte de la mesure). Sinon `SumCapteurError=0` (2 échecs consécutifs exigés).
 3. **Cohérence** : `ValidCapteurData(MIN/MAX...)` sur T/H/P (lit bornes via `GetParam`) :
-   somme > 0 → **erreur 4**, `NULL`.
+   la valeur fautive est signalée (**erreur 4**), affichée sur la série, puis passée à
+   `NAN` (→ `NA`) sans annuler l'enregistrement.
+   Puis les activations `TEMP_AIR` / `HYGR` / `PRESSURE` = 0 forcent aussi `NAN`.
 4. **Horodatage** : `SANS_RTC ? GenererDateSansRtc() : rtc_clock.now()` avec
-   contrôle timeout I2C → **erreur 1**, `NULL`.
+   contrôle timeout I2C → **erreur 1**, `NULL` (sans date, pas de ligne de log).
 5. Remplit le `Record` statique, retourne son pointeur (toujours valide).
+   `NULL` ne reste donc que pour la RTC (1) et le GPS (2).
 
 ---
 
@@ -261,15 +280,17 @@ moins la pile) est trop petit — `malloc` refusait systématiquement).
   retourne le premier dont `size() < FILE_MAX_SIZE`. Échec open → **erreur 5**+`false` ;
   les 10 pleins → **erreur 6**+`false`.
 - `AppendSdCard(Record*)` : écriture immédiate (pas de lot : ~100 o de RAM
-  libre interdisent un lot de 5). `GetFile(date du record)`, formate
-  `lat(6);lon(6);temp(2);humi(2);press(2)\n` (buffer 64 o, `FormatDecimal`,
-  `;` et `\n` manuels) puis `fichier.write()`. Échec partiel → **erreur 6**.
+  libre interdisent un lot de 5). `GetFile(date du record)`, écrit
+  `lat(6);lon(6);temp(2);humi(2);press(2)\n` via `EcritChamp()` (champ 12 o,
+  `FormateChamp` → `NA` si la valeur est `NAN`). Échec partiel → **erreur 6**.
   `close()`. Retour `1=erreur, 0=ok`.
 - `FormatDecimal(float v, uint8_t decimales, char *out)` : écrit sans `%f`
   (printf flottant désactivé pour la flash), arrondi `+0.5`, bourrage zéros
   fractionnaires, retourne fin de chaîne (pratique pour ajouter ` C`, ` %`, ` hPa`).
+  `FormateChamp` l'enveloppe : si `isnan(v)`, écrit `NA` (3 o) à la place.
 
 Exemple de ligne : `48.85661;2.35222;21.45;55.12;1013.25`
+Capteur muet ou hors bornes : `48.85661;2.35222;NA;55.12;NA`
 
 ---
 
@@ -295,10 +316,10 @@ pour éviter une spécialisation par constantes (~250 o chacune).
 | 6 | SD pleine | rouge / blanc 500/500 |
 
 `codeEchec` (RAM, `GetNewRecord` + `OnImprimeLerreurViaLed`) mémorise le dernier
-code (1–4, 6 ci-dessus ; le `7` = `malloc` refusé a disparu avec le `Record`
+code (1–6 ci-dessus ; le `7` = `malloc` refusé a disparu avec le `Record`
 statique) ; la maintenance affiche `Echec N` à chaque mesure ratée pour dire
-quel sous-système bloque
-(raccourci `6` en `SD pleine` : flash à ~100 %, chaque octet compte).
+quel sous-système bloque (seuls `1` et `2` peuvent encore annuler une mesure,
+les codes `3`/`4` donnent maintenant `NA`).
 
 ---
 
@@ -314,6 +335,10 @@ ni de `malloc`/`free` (record statique : le tas est trop petit),
 `PrintRecord` réutilise un seul tampon valeur 20 o + `AfficheLigne` 40 o
 (184 o imbriqués dépassaient les ~270 o de pile libre et corrompaient la RAM
 — flot d'octets illisibles sur la série).
+Code partagé plutôt que dupliqué : `DeuxChiffres()` (noms de fichiers 8.3 +
+horodatage du tableau), `FormateChamp()` (`NA` si `isnan`, sinon `FormatDecimal`)
+et `EcritChamp()` (5 champs du log SD, tampon fourni par l'appelant pour ne pas
+empiler un cadre de plus).
 Budget RAM/pile/flash : voir §13 (avant tout ajout).
 
 ---
@@ -322,7 +347,7 @@ Budget RAM/pile/flash : voir §13 (avant tout ajout).
 
 1. Maintenir ROUGE au reset → mode CONFIG (LED jaune).
 2. Terminal 9600 baud : `LOG_INTERVAL=5` → `OK`, etc. ; rouge long 5 s → STANDARD.
-3. STANDARD (vert) : log toutes les `LOG_INTERVAL` s dans `AAMMJJ_0.LOG`,...
+3. STANDARD (vert) : log toutes les `LOG_INTERVAL` **minutes** dans `AAMMJJ_0.LOG`,...
 4. Vert long → ECO (bleu, période doublée, GPS 1/2) ; en ECO, rouge long → STANDARD ;
    rouge long en STANDARD → MAINTENANCE (orange, tableau série chaque ~1 s) ;
    rouge long en MAINTENANCE → STANDARD.
@@ -330,22 +355,31 @@ Budget RAM/pile/flash : voir §13 (avant tout ajout).
 
 Limites connues : `TIMEOUT` documenté en secondes mais comparé à `millis()` en ms
 (`*1000`), `ProcessCommande` refuse `>100000000` avant bornes, `Record.Latitude/Longitude`
-en `double` mais stockés via `float LesKordonnesGps[2]`, `MaxFileSize` global inutilisé
-(au profit du paramètre `FILE_MAX_SIZE`).
+en `double` mais stockés via `float LesKordonnesGps[2]`.
 
 ---
 
 ## 13. Budget mémoire — à lire avant tout ajout
 
-### 13.1 Chiffres (build actuel)
+### 13.1 Chiffres (build actuel, mesurés)
 
-| Ressource | Valeur | Remarque |
+`pio run -e uno` / `-e uno_sans_rtc` :
+
+| Ressource | `uno` | `uno_sans_rtc` |
 |---|---|---|
-| RAM statique (.data + .bss + .noinit) | 1590 / 2048 o (78 %) | `uno` : 1592 o. 1787 o avant les corrections (§13.4) |
+| RAM statique (.data + .bss + .noinit) | 1598 / 2048 o (78,0 %) | 1596 / 2048 o (77,9 %) |
+| Flash | 98,7 % (31824 o, **432 o libres**) | 98,4 % (31744 o, 512 o libres) |
+
+| Autre | Valeur | Remarque |
+|---|---|---|
 | Pile libre au boot | ~337 o | mesure historique (diagnostic §13.3 retiré) |
 | Pile libre minimale (cycle de mesure) | **17 o** | mesure historique, pic pendant l'écriture SD : marge trop faible |
 | Tas maximal | 44 o | BME280 (4 `new` dans `begin()`), SD (1 `malloc` par `SD.open`) |
-| Flash | 97,6 % (~762 o libres) | `uno` : 97,9 % (~664 o libres) |
+
+La RAM statique a augmenté de 6 o avec le 15e paramètre (`PRESSURE`) : la marge de
+pile, déjà à 17 o, est donc à re-mesurer (§13.3) avant un run long. Pour récupérer
+ces 6 o, le levier le plus simple est de retirer `PRESSURE` (paramètre non
+indispensable au fonctionnement).
 
 La pile et le tas partagent la même zone de RAM (entre la fin de la RAM statique et
 `RAMEND`), sans garde : un débordement n'est pas signalé, il corrompt la mémoire
@@ -416,3 +450,38 @@ Conforme :
 - **Économie d'énergie partielle.** Le GPS n'est pas mis hors tension (aucune broche de
   commande, SoftwareSerial continue de recevoir) : l'économie se limite à `LOG_INTERVAL x2`
   et au GPS une mesure sur deux. Le BME280 reste lu à chaque mesure.
+
+### 14.1 Écarts relevés en relisant le PDF « MODE DE FONCTIONNEMENT »
+
+Le PDF (5 pages) décrit les 4 modes, les couleurs LED, les paramètres, les commandes
+série et la rotation des fichiers. Le code respecte les modes, les couleurs, les appuis
+5 s, les 30 min et la désactivation des mesures en CONFIG. État après la mise en
+conformité (build 98,7 % de flash) :
+
+| Cahier des charges | État | Remarque |
+|---|---|---|
+| `LOG_INTERVAL` en **minutes** (10 min par défaut) | **conforme** | `* 60000`, bornes 1–1440 min |
+| donnée d'un capteur en échec écrite `"NA"` | **conforme** | `NAN` → `NA` dans le log et dans le tableau maintenance |
+| commande `RESET` | **conforme** | remet les 15 paramètres à `LesDefauts` |
+| commande `VERSION` | **conforme** | `VERSION 2 lot 1` (version/lot EEPROM) |
+| paramètre `PRESSURE` {0,1} | **conforme** | 15 paramètres, `0` → pression `NA` |
+| `PRESSURE_MIN=850`, `PRESSURE_MAX=1080` | **conforme** | idem dans `LesDefauts` |
+| activations `TEMP_AIR` / `HYGR` | **conforme** | `0` → `NA` ; `LUMIN_*` restent réservés (pas de capteur) |
+| `CLOCK`, `DATE`, `DAY` | **non implémenté** | la conversion date ↔ horodatage de RTClib coûte ~830 o ; il ne reste que 432 o libres. Ces commandes répondent `Commande inconnu` |
+| rotation : toujours écrire en révision 0, copier le fichier plein en révision suivante | **non implémenté** | copier exige 2 objets `File` (~44 o de pile) + un tampon, incompatible avec 17 o de marge (§13.1). Le code écrit `_0` … `_9` : mêmes données, numérotation différente |
+| maintenance accessible depuis STANDARD **ou** ECO, retour au mode précédent | **écart assumé** | contradiction interne du PDF ; « ECO → rouge long → STANDARD » conservé (§14) |
+
+Rappel : `TIMEOUT` est bien en secondes dans le code (`* 1000`), et 2 échecs consécutifs
+déclenchent l'erreur capteur, comme demandé.
+
+### 14.2 Pistes si `CLOCK` / `DATE` / `DAY` deviennent obligatoires
+
+Il faudrait libérer ~900 o de flash. Leviers mesurés/estimés :
+- supprimer l'affichage de debug d'erreur 4 (`AfficheLigne` + `FormatDecimal` dans
+  `ValidCapteurData`) : ~90 o ;
+- supprimer la ligne d'aide SD au boot (`Verif CS=4 FAT32...`) : ~42 o ;
+- raccourcir les messages d'erreur série : ~30 o ;
+- retirer `PRESSURE` (15e paramètre) : ~50 o de flash + 6 o de RAM ;
+- remplacer le `switch` de `OnImprimeLerreurViaLed` par une table `PROGMEM` : ~60 o.
+Total ≈ 270 o : insuffisant tel quel, `CLOCK`/`DATE` demanderaient aussi de sacrifier
+`VERSION` (~55 o) et `RESET` (~90 o), soit troquer deux commandes contre deux autres.

@@ -78,10 +78,11 @@ static const char NOM_MAX_TEMP_AIR[] PROGMEM = "MAX_TEMP_AIR";
 static const char NOM_HYGR[] PROGMEM = "HYGR";
 static const char NOM_HYGR_MINT[] PROGMEM = "HYGR_MINT";
 static const char NOM_HYGR_MAXT[] PROGMEM = "HYGR_MAXT";
+static const char NOM_PRESSURE[] PROGMEM = "PRESSURE";
 static const char NOM_PRESSURE_MIN[] PROGMEM = "PRESSURE_MIN";
 static const char NOM_PRESSURE_MAX[] PROGMEM = "PRESSURE_MAX";
 
-Parameters losParametros[14] = {
+Parameters losParametros[15] = {
     {NOM_LOG_INTERVAL, 10},
     {NOM_TIMEOUT, 30},
     {NOM_FILE_MAX_SIZE, 2048},
@@ -94,11 +95,12 @@ Parameters losParametros[14] = {
     {NOM_HYGR, 1},
     {NOM_HYGR_MINT, 0},
     {NOM_HYGR_MAXT, 50},
-    {NOM_PRESSURE_MIN, 800},
-    {NOM_PRESSURE_MAX, 1100}};
+    {NOM_PRESSURE, 1},
+    {NOM_PRESSURE_MIN, 850},
+    {NOM_PRESSURE_MAX, 1080}};
 
-static const Bornes LesBornes[14] PROGMEM = {
-    {1, 1440},   // LOG_INTERVAL
+static const Bornes LesBornes[15] PROGMEM = {
+    {1, 1440},   // LOG_INTERVAL (minutes)
     {1, 255},    // TIMEOUT
     {1, 65535},  // FILE_MAX_SIZE
     {0, 1},      // LUMIN
@@ -110,6 +112,14 @@ static const Bornes LesBornes[14] PROGMEM = {
     {0, 1},      // HYGR
     {-40, 85},   // HYGR_MINT
     {-40, 85},   // HYGR_MAXT
+    {0, 1},      // PRESSURE
     {300, 1100}, // PRESSURE_MIN
     {300, 1100}  // PRESSURE_MAX
 };
+
+// Valeurs par defaut (commande RESET), meme ordre que losParametros.
+static const long LesDefauts[15] PROGMEM = {
+    10, 30, 2048, 1, 255, 768, 1, -10, 60, 1, 0, 50, 1, 850, 1080};
+
+// Nombre de parametres (losParametros et LesBornes : meme ordre, meme taille).
+static const uint8_t NB_PARAMS = sizeof(losParametros) / sizeof(losParametros[0]);

@@ -9,13 +9,9 @@
 #include <SPI.h>
 #include <SD.h>
 #include <TinyGPSPlus.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <time.h>
-#include <string.h>
-#include <RTClib.h>
-#include <string.h>
 #include <EEPROM.h>
+#include <stdlib.h> // ltoa (FormatDecimal)
+#include <string.h> // strcmp_P / strncpy_P
 #include "main.h"
  
 #define SIX_SEVEN_SIX 6
@@ -23,7 +19,7 @@
 #define CLK_LED 8
 #define DATA_LED 9
 #define LED_COUNT 1
-#define VERSION 1
+#define VERSION 2 // 2 : plan EEPROM a 15 parametres (ajout de PRESSURE)
 #define NUMERO_LOT 1
 #define CAPTEUR_TIMEOUT 25000
 #define BOUTON_ROUGE 2
@@ -42,7 +38,6 @@ TinyGPSPlus gps;
 // latitude gps / longitude gps
 // Pile, size :2
 float LesKordonnesGps[2];
-const int MaxFileSize = 1000;
 // CS de la carte SD : D4 (cablage materiel MOSI=D11 MISO=D12 SCK=D13).
 // La LED a ete deplacee sur D8/D9 pour liberer D4 (et D3 = bouton vert !).
 const int SD_CS = 4;
@@ -113,23 +108,17 @@ __attribute__((noinline, noclone)) static void AppliqueCouleur(uint8_t idx)
                    pgm_read_byte(&COULEURS_LED[idx][2]));
 }
 
+// Couleur continue de chaque mode (index = valeur de ModeFonctionnement).
+static const uint8_t COULEUR_PAR_MODE[4] PROGMEM = {
+    COUL_JAUNE,  // MODE_CONFIG
+    COUL_VERT,   // MODE_STANDARD
+    COUL_BLEU,   // MODE_ECO
+    COUL_ORANGE, // MODE_MAINTENANCE
+};
+
 __attribute__((noinline, noclone)) static void AfficheCouleurMode()
 {
-  switch (modeActuel)
-  {
-  case MODE_CONFIG:
-    AppliqueCouleur(COUL_JAUNE);
-    break;
-  case MODE_ECO:
-    AppliqueCouleur(COUL_BLEU);
-    break;
-  case MODE_MAINTENANCE:
-    AppliqueCouleur(COUL_ORANGE);
-    break;
-  default:
-    AppliqueCouleur(COUL_VERT); // MODE_STANDARD
-    break;
-  }
+  AppliqueCouleur(pgm_read_byte(&COULEUR_PAR_MODE[(uint8_t)modeActuel]));
 }
 
 // Alterne 2 couleurs (durees en ms, 1 Hz => 500/500 ; 2x plus long => 333/667)
@@ -162,7 +151,7 @@ static long BorneMax(int i)
 void SaveEepromParameters()
 {
   int adresse = EEPROM_PARAMS;
-  for (unsigned int i = 0; i < sizeof(losParametros) / sizeof(Parameters); i++)
+  for (uint8_t i = 0; i < NB_PARAMS; i++)
   {
     EEPROM.put(adresse, losParametros[i].Value);
     adresse += sizeof(long);
@@ -177,22 +166,26 @@ void InitLed()
 void InitEeprom()
 {
   uint16_t magic = 0;
+  uint8_t version = 0;
   EEPROM.get(0, magic);
+  EEPROM.get(EEPROM_VERSION, version);
 
-  if (magic != EEPROM_MAGIC)
+  // Premier boot, ou EEPROM ecrite par une version au plan different :
+  // on repart des valeurs par defaut (sinon les 15 longs seraient mal relus).
+  if (magic != EEPROM_MAGIC || version != (uint8_t)VERSION)
   {
     EEPROM.put(0, (uint16_t)EEPROM_MAGIC);
-    EEPROM.put(2, (uint8_t)VERSION);
-    EEPROM.put(3, (uint8_t)NUMERO_LOT);
+    EEPROM.put(EEPROM_VERSION, (uint8_t)VERSION);
+    EEPROM.put(EEPROM_LOT, (uint8_t)NUMERO_LOT);
     SaveEepromParameters();
     return;
   }
 
-  EEPROM.put(2, (uint8_t)VERSION);
-  EEPROM.put(3, (uint8_t)NUMERO_LOT);
+  EEPROM.put(EEPROM_VERSION, (uint8_t)VERSION);
+  EEPROM.put(EEPROM_LOT, (uint8_t)NUMERO_LOT);
 
   int adresse = EEPROM_PARAMS;
-  for (unsigned int i = 0; i < sizeof(losParametros) / sizeof(Parameters); i++)
+  for (uint8_t i = 0; i < NB_PARAMS; i++)
   {
     long valeur = losParametros[i].Value;
     EEPROM.get(adresse, valeur);
@@ -267,29 +260,20 @@ void InitSd()
 
 void InitCapteur()
 {
-  bool ok = false;
-  for (int essai = 0; essai < CAPTEUR_RETRY && !ok; essai++)
+  for (uint8_t essai = 0; essai < CAPTEUR_RETRY; essai++)
   {
     Wire.clearWireTimeoutFlag();
-    ok = capteur.begin(0x76);
-    Wire.clearWireTimeoutFlag();
-    if (!ok)
+    if (capteur.begin(0x76) || capteur.begin(0x77))
     {
-      ok = capteur.begin(0x77);
       Wire.clearWireTimeoutFlag();
+      return;
     }
-    if (!ok)
-    {
-      delay(100);
-    }
+    Wire.clearWireTimeoutFlag();
+    delay(100);
   }
-  if (!ok)
-  {
-    // Message detaille inutile : OnImprimeLerreurViaLed(3) signale deja
-    // "Erreur 3 : BME280" + LED (flash a ~100 %, chaque octet compte).
-    OnImprimeLerreurViaLed(3);
-    return;
-  }
+  // Message detaille inutile : OnImprimeLerreurViaLed(3) signale deja
+  // "Erreur 3 : BME280" + LED (flash a ~100 %, chaque octet compte).
+  OnImprimeLerreurViaLed(3);
 }
 
 struct EtatBouton
@@ -513,6 +497,28 @@ char *FormatDecimal(float v, uint8_t decimales, char *out)
   return p;
 }
 
+// Ecrit deux chiffres (00-99) et renvoie la fin de la chaine.
+static char *DeuxChiffres(char *p, uint8_t valeur)
+{
+  *p++ = '0' + valeur / 10;
+  *p++ = '0' + valeur % 10;
+  return p;
+}
+
+// Comme FormatDecimal, mais ecrit "NA" si la valeur est invalide (isnan) :
+// c'est ce qu'exige le cahier des charges pour un capteur muet ou incoherent.
+static char *FormateChamp(float valeur, uint8_t decimales, char *out)
+{
+  if (isnan(valeur))
+  {
+    out[0] = 'N';
+    out[1] = 'A';
+    out[2] = '\0';
+    return out + 2;
+  }
+  return FormatDecimal(valeur, decimales, out);
+}
+
 // Ouvre le fichier AAMMJJ_i.LOG du jour (i de 0 a 9) dont la taille est sous FILE_MAX_SIZE.
 // Nom au format 8.3 : la bibliotheque SD ne gere pas les noms longs.
 // false=erreur
@@ -531,24 +537,21 @@ bool GetFile(DateTime *date, File &fichier)
     carteSdOk = true;
   }
   long max_size = GetParam(F("FILE_MAX_SIZE"))->Value;
+  // Nom 8.3 manuel AAMMJJ_i.LOG (sans sprintf_P -> vfprintf ~950 o economises).
   char nomFichier[13];
-  for (int i = 0; i < 10; i++)
+  char *p = DeuxChiffres(nomFichier, date->year() % 100);
+  p = DeuxChiffres(p, date->month());
+  p = DeuxChiffres(p, date->day());
+  *p++ = '_';
+  *p++ = '0'; // numero de revision, remplace dans la boucle
+  *p++ = '.';
+  *p++ = 'L';
+  *p++ = 'O';
+  *p++ = 'G';
+  *p = '\0';
+  for (uint8_t i = 0; i < 10; i++)
   {
-    // Nom 8.3 manuel (sans sprintf_P -> vfprintf ~950 o economises).
-    uint8_t yy = date->year() % 100, mm = date->month(), dd = date->day();
-    nomFichier[0] = '0' + yy / 10;
-    nomFichier[1] = '0' + yy % 10;
-    nomFichier[2] = '0' + mm / 10;
-    nomFichier[3] = '0' + mm % 10;
-    nomFichier[4] = '0' + dd / 10;
-    nomFichier[5] = '0' + dd % 10;
-    nomFichier[6] = '_';
-    nomFichier[7] = '0' + i;
-    nomFichier[8] = '.';
-    nomFichier[9] = 'L';
-    nomFichier[10] = 'O';
-    nomFichier[11] = 'G';
-    nomFichier[12] = '\0';
+    nomFichier[7] = '0' + i; // numero de revision
     fichier = SD.open(nomFichier, FILE_WRITE);
     if (!fichier)
     {
@@ -671,13 +674,29 @@ Record *GetNewRecord(int withGps)
     {
       OnImprimeLerreurViaLed(3);
     }
-    return NULL;
+    // Une mesure ratee n'annule plus l'enregistrement : le cahier des charges
+    // demande d'ecrire "NA" pour la donnee du capteur qui n'a pas repondu.
+    temperature = NAN;
+    pression = NAN;
+    humidity = NAN;
   }
-  SumCapteurError = 0;
-
-  if ((ValidCapteurData(F("MIN_TEMP_AIR"), F("MAX_TEMP_AIR"), temperature) + ValidCapteurData(F("HYGR_MINT"), F("HYGR_MAXT"), humidity) + ValidCapteurData(F("PRESSURE_MIN"), F("PRESSURE_MAX"), pression)) > 0)
+  else
   {
-    return NULL;
+    SumCapteurError = 0;
+    // Valeur hors bornes : signalee (erreur 4) puis remplacee par "NA".
+    if (ValidCapteurData(F("MIN_TEMP_AIR"), F("MAX_TEMP_AIR"), temperature))
+      temperature = NAN;
+    if (ValidCapteurData(F("HYGR_MINT"), F("HYGR_MAXT"), humidity))
+      humidity = NAN;
+    if (ValidCapteurData(F("PRESSURE_MIN"), F("PRESSURE_MAX"), pression))
+      pression = NAN;
+    // Capteur desactive par configuration (TEMP_AIR / HYGR / PRESSURE = 0) : "NA".
+    if (GetParam(F("TEMP_AIR"))->Value == 0)
+      temperature = NAN;
+    if (GetParam(F("HYGR"))->Value == 0)
+      humidity = NAN;
+    if (GetParam(F("PRESSURE"))->Value == 0)
+      pression = NAN;
   }
 
   DateTime maintenant;
@@ -701,24 +720,52 @@ Record *GetNewRecord(int withGps)
   // (ecrit sur SD avant la mesure suivante). malloc echouait
   // systematiquement : tas plein (85 % de RAM statique + pile).
   static Record leRecord;
-  Record *record_ptr = &leRecord;
-  record_ptr->Latitude = LesKordonnesGps[0];
-  record_ptr->Longitude = LesKordonnesGps[1];
-  record_ptr->Date = maintenant;
-  record_ptr->Temperature = temperature;
-  record_ptr->Humidity = humidity;
-  record_ptr->Pressure = pression;
- 
-  return record_ptr;
+  leRecord.Latitude = LesKordonnesGps[0];
+  leRecord.Longitude = LesKordonnesGps[1];
+  leRecord.Date = maintenant;
+  leRecord.Temperature = temperature;
+  leRecord.Humidity = humidity;
+  leRecord.Pressure = pression;
+
+  return &leRecord;
 }
  
+
+// Commandes du cahier des charges qui ne sont pas des parametres numeriques.
+// Renvoie un message d'erreur, ou NULL quand la commande est acceptee
+// (l'appelant sauvegarde alors l'EEPROM et repond "OK").
+// CLOCK / DATE / DAY ne sont pas implementes : la conversion date <-> horodatage
+// de RTClib coute ~830 o de flash et il n'en reste que ~420 de libre (cf. doc).
+static const __FlashStringHelper *CommandeSpeciale(char commande[])
+{
+  if (!strcmp_P(commande, PSTR("RESET")))
+  {
+    for (uint8_t i = 0; i < NB_PARAMS; i++)
+    {
+      losParametros[i].Value = (long)pgm_read_dword(&LesDefauts[i]);
+    }
+    return NULL;
+  }
+  if (!strcmp_P(commande, PSTR("VERSION")))
+  {
+    // Version et lot tiennent sur un chiffre (codes 1..9).
+    Serial.print(F("VERSION "));
+    Serial.write('0' + VERSION);
+    Serial.print(F(" lot "));
+    Serial.write('0' + NUMERO_LOT);
+    Serial.println();
+    return NULL;
+  }
+  return F("Commande inconnu");
+}
 
 const __FlashStringHelper *ProcessCommande(char commande[], char value[])
 {
   Parameters *param = GetParam(commande);
   if (param == NULL)
   {
-    return F("Commande inconnu");
+    // RESET / VERSION (syntaxe differente des parametres numeriques)
+    return CommandeSpeciale(commande);
   }
   // Parsing manuel d'un entier signe (remplace strtol, ~500 o de flash).
   // value doit etre termine par '\0'.
@@ -762,14 +809,13 @@ const __FlashStringHelper *ProcessCommande(char commande[], char value[])
 // Recherche par nom saisi en RAM (commande recue par la liaison serie)
 Parameters *GetParam(const char *name)
 {
-  for (int i = 0; i < sizeof(losParametros) / sizeof(Parameters); i++)
+  for (uint8_t i = 0; i < NB_PARAMS; i++)
   {
     if (strcmp_P(name, losParametros[i].Name) == 0)
     {
       return &losParametros[i];
     }
   }
-  // printf("Paramétros non trouvé gringo ! ");
   return NULL;
 }
 
@@ -811,6 +857,20 @@ int ValidCapteurData(const __FlashStringHelper *nomMin, const __FlashStringHelpe
   return 0;
 }
  
+// Ecrit un champ (valeur formatee + separateur) sur la carte SD.
+// Le tampon vient de l'appelant : la pile ne grandit pas d'un cadre.
+// champ[12] suffit : plus grand champ "-180.123456" = 11 + '\0' = 12.
+static bool EcritChamp(File &fichier, char *champ, float valeur, uint8_t decimales, uint8_t separateur)
+{
+  char *fin = FormateChamp(valeur, decimales, champ);
+  size_t taille = (size_t)(fin - champ);
+  // Deux ecritures distinctes (pas de &&) : le separateur est ecrit meme
+  // si la valeur a echoue, comme dans l'ancien enchainement.
+  bool okValeur = (fichier.write((const uint8_t *)champ, taille) == taille);
+  bool okSeparateur = (fichier.write(separateur) == 1);
+  return okValeur && okSeparateur;
+}
+
 // Ecrit record sur la SD (record statique, valide pendant l'ecriture).
 // Ecriture immediate : un lot ne tient pas en RAM (~100 o libres).
 // 1=error,0=success
@@ -823,25 +883,12 @@ int AppendSdCard(Record *record)
   }
   // Ecriture morceau par morceau avec un seul champ[12] : buffer[48/64]
   // + File + SD depassait la pile (~270 o libres) -> "Mo?" + reset.
-  // champ[12] suffit : plus grand champ "-180.123456" = 11 + '\0' = 12.
   char champ[12];
-  char *fin;
-  bool ok = true;
-  fin = FormatDecimal(record->Latitude, 6, champ);
-  ok &= (fichier.write((const uint8_t *)champ, fin - champ) == (size_t)(fin - champ));
-  ok &= (fichier.write((uint8_t)';') == 1);
-  fin = FormatDecimal(record->Longitude, 6, champ);
-  ok &= (fichier.write((const uint8_t *)champ, fin - champ) == (size_t)(fin - champ));
-  ok &= (fichier.write((uint8_t)';') == 1);
-  fin = FormatDecimal(record->Temperature, 2, champ);
-  ok &= (fichier.write((const uint8_t *)champ, fin - champ) == (size_t)(fin - champ));
-  ok &= (fichier.write((uint8_t)';') == 1);
-  fin = FormatDecimal(record->Humidity, 2, champ);
-  ok &= (fichier.write((const uint8_t *)champ, fin - champ) == (size_t)(fin - champ));
-  ok &= (fichier.write((uint8_t)';') == 1);
-  fin = FormatDecimal(record->Pressure, 2, champ);
-  ok &= (fichier.write((const uint8_t *)champ, fin - champ) == (size_t)(fin - champ));
-  ok &= (fichier.write((uint8_t)'\n') == 1);
+  bool ok = EcritChamp(fichier, champ, record->Latitude, 6, ';');
+  ok &= EcritChamp(fichier, champ, record->Longitude, 6, ';');
+  ok &= EcritChamp(fichier, champ, record->Temperature, 2, ';');
+  ok &= EcritChamp(fichier, champ, record->Humidity, 2, ';');
+  ok &= EcritChamp(fichier, champ, record->Pressure, 2, '\n');
   if (!ok)
   {
     OnImprimeLerreurViaLed(6);
@@ -910,28 +957,20 @@ void PrintRecord(Record *record)
   char val[20];
   {
     char *q = val;
-    uint8_t jj = record->Date.day(), mo = record->Date.month();
-    uint16_t aa = record->Date.year();
-    uint8_t hh = record->Date.hour(), mi = record->Date.minute(), ss = record->Date.second();
-    *q++ = '0' + jj / 10;
-    *q++ = '0' + jj % 10;
+    DateTime d = record->Date;
+    uint16_t aa = d.year();
+    q = DeuxChiffres(q, d.day());
     *q++ = '/';
-    *q++ = '0' + mo / 10;
-    *q++ = '0' + mo % 10;
+    q = DeuxChiffres(q, d.month());
     *q++ = '/';
-    *q++ = '0' + aa / 1000;
-    *q++ = '0' + (aa / 100) % 10;
-    *q++ = '0' + (aa / 10) % 10;
-    *q++ = '0' + aa % 10;
+    q = DeuxChiffres(q, aa / 100);
+    q = DeuxChiffres(q, aa % 100);
     *q++ = ' ';
-    *q++ = '0' + hh / 10;
-    *q++ = '0' + hh % 10;
+    q = DeuxChiffres(q, d.hour());
     *q++ = ':';
-    *q++ = '0' + mi / 10;
-    *q++ = '0' + mi % 10;
+    q = DeuxChiffres(q, d.minute());
     *q++ = ':';
-    *q++ = '0' + ss / 10;
-    *q++ = '0' + ss % 10;
+    q = DeuxChiffres(q, d.second());
     *q = '\0';
   }
 
@@ -943,21 +982,21 @@ void PrintRecord(Record *record)
   AfficheLigne(F("Longitude"), val);
 
   // Ajout manuel de l'unite (evite strcat_P pour economiser la flash).
-  // FormatDecimal renvoie la fin de chaine, on s'en sert directement.
+  // FormateChamp renvoie la fin de chaine ("NA" si la valeur est invalide).
   char *fin;
-  fin = FormatDecimal(record->Temperature, 2, val);
+  fin = FormateChamp(record->Temperature, 2, val);
   *fin++ = ' ';
   *fin++ = 'C';
   *fin = '\0';
   AfficheLigne(F("Temperature"), val);
 
-  fin = FormatDecimal(record->Humidity, 2, val);
+  fin = FormateChamp(record->Humidity, 2, val);
   *fin++ = ' ';
   *fin++ = '%';
   *fin = '\0';
   AfficheLigne(F("Humidite"), val);
 
-  fin = FormatDecimal(record->Pressure, 2, val);
+  fin = FormateChamp(record->Pressure, 2, val);
   *fin++ = ' ';
   *fin++ = 'h';
   *fin++ = 'P';
@@ -986,9 +1025,9 @@ void ModeMaintenance()
       return;
     }
 
-    // GetNewRecord rend NULL (erreur deja signalee) quand la mesure echoue :
-    // on affiche quand meme un message (sinon silence total entre deux
-    // erreurs, le 1er echec capteur etant volontairement muet).
+    // NULL seulement pour une horloge (1) ou un GPS (2) indisponible : un capteur
+    // muet ou incoherent (3/4) donne maintenant un enregistrement avec "NA".
+    // On affiche quand meme un message, sinon silence total entre deux erreurs.
     Record *record = GetNewRecord(true);
     if (record != NULL)
     {
@@ -996,9 +1035,8 @@ void ModeMaintenance()
     }
     else
     {
-      // Precise QUEL sous-systeme bloque (1=RTC, 2=GPS, 3=BME280,
-      // 4=donnee incoherente). Chiffre via Serial.write('0'+code)
-      // car print(int) tirerait ~200 o de division logicielle sur AVR.
+      // Precise QUEL sous-systeme bloque (1=RTC, 2=GPS). Chiffre via
+      // Serial.write('0'+code) car print(int) tirerait ~200 o de division.
       Serial.print(F("Echec "));
       Serial.write('0' + codeEchec);
       Serial.println();
@@ -1020,7 +1058,8 @@ void ModeNormalOrEco(bool ecoMode)
   // le moniteur. Ici le texte part complet avant la mesure.
   Serial.flush();
   int shouldDoGPS = true;
-  unsigned long intervalle = (unsigned long)GetParam(F("LOG_INTERVAL"))->Value * 1000 * (ecoMode ? 2 : 1);
+  // LOG_INTERVAL est en minutes (cahier des charges) : 10 min par defaut.
+  unsigned long intervalle = (unsigned long)GetParam(F("LOG_INTERVAL"))->Value * 60000UL * (ecoMode ? 2 : 1);
  
   while (1)
   {
@@ -1064,7 +1103,7 @@ void ModeNormalOrEco(bool ecoMode)
       delay(10);
     }
 
-    if (ecoMode == 1)
+    if (ecoMode)
     {
       shouldDoGPS = !shouldDoGPS;
     }
@@ -1124,33 +1163,22 @@ void ModeConfig()
     // Echo : le moniteur PlatformIO n'affiche pas les caracteres tapes
     // (pas d'echo local), la carte les renvoie donc au fur et a mesure.
     Serial.write(caractere);
-    
-    
+
     if (caractere == '=')
     {
       haveEqual = true;
     }
-    
-    
-    else
+    // Les buffers font 16 o (15 caracteres + '\0') : on ignore le surplus
+    else if (haveEqual)
     {
-      // Les buffers font 16 o (15 caracteres + '\0') : on ignore le surplus
-      if (haveEqual)
+      if (currentValeurIndex < 15)
       {
-        if (currentValeurIndex < 15)
-        {
-          valeur[currentValeurIndex] = caractere;
-          currentValeurIndex++;
-        }
+        valeur[currentValeurIndex++] = caractere;
       }
-      else
-      {
-        if (currentCommandeIndex < 15)
-        {
-          commande[currentCommandeIndex] = caractere;
-          currentCommandeIndex++;
-        }
-      }
+    }
+    else if (currentCommandeIndex < 15)
+    {
+      commande[currentCommandeIndex++] = caractere;
     }
   }
 }
@@ -1226,16 +1254,9 @@ void loop()
     ModeConfig();
     // Sortie : appui long rouge (5 s) ou 30 min sans saisie. L'appui long
     // est lu en premier pour toujours consommer son evenement.
+    if (BoutonRougeAppuiLong() || (millis() - derniereActiviteConfig >= CONFIG_INACTIVITE_MS))
     {
-      bool sortie = BoutonRougeAppuiLong();
-      if (millis() - derniereActiviteConfig >= CONFIG_INACTIVITE_MS)
-      {
-        sortie = true;
-      }
-      if (sortie)
-      {
-        modeActuel = MODE_STANDARD;
-      }
+      modeActuel = MODE_STANDARD;
     }
     break;
 
