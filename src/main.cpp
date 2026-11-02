@@ -135,6 +135,48 @@ __attribute__((noinline, noclone)) static void ClignoteLed(uint8_t c1, uint8_t c
   AfficheCouleurMode();
 }
  
+// Erreur 2 (GPS sans fix) : clignotement rouge/jaune continu jusqu'au fix.
+// Non bloquant : MajClignotementGps() est appelee par PompeGps(), donc
+// pendant toutes les attentes (setup, mesures, intervalle).
+bool gpsClignote = false;
+bool gpsPhaseRouge = false;
+unsigned long gpsDernierChangement = 0;
+
+// Erreur 2 : rouge tout de suite, puis MajClignotementGps prend le relais.
+void DemarreClignotementGps()
+{
+  if (!gpsClignote)
+  {
+    gpsClignote = true;
+    gpsPhaseRouge = true;
+    gpsDernierChangement = millis();
+    AppliqueCouleur(COUL_ROUGE);
+  }
+}
+
+// Alterne rouge/jaune toutes les 500 ms (1 Hz). Le fix arrete le clignotement
+// et rend la couleur du mode. Pas de delay() : appelee dans les boucles d'attente.
+void MajClignotementGps()
+{
+  if (!gpsClignote)
+  {
+    return;
+  }
+  if (gps.location.isValid())
+  {
+    gpsClignote = false;
+    AfficheCouleurMode();
+    return;
+  }
+  unsigned long maintenant = millis();
+  if (maintenant - gpsDernierChangement >= 500UL)
+  {
+    gpsDernierChangement = maintenant;
+    gpsPhaseRouge = !gpsPhaseRouge;
+    AppliqueCouleur(gpsPhaseRouge ? COUL_ROUGE : COUL_JAUNE);
+  }
+}
+
 SoftwareSerial gpsSerial(SIX_SEVEN_SIX, SIX_SEVEN_SEVEN); // RX, TX
 
 // Bornes lues en PROGMEM (voir LesBornes dans main.h)
@@ -594,6 +636,7 @@ void PompeGps()
   {
     gps.encode(gpsSerial.read());
   }
+  MajClignotementGps();
 }
 
 // Initialise le GPS et attend le fix satellite (bloquant).
@@ -1043,6 +1086,8 @@ void PrintRecord(Record *record)
 void ModeMaintenance()
 {
   sansPositionOk = true;
+  // GPS non requis en maintenance : on arrete l'eventuel clignotement d'erreur 2.
+  gpsClignote = false;
   // Carte SD liberee : elle peut etre retiree ou changee sans risque.
   // carteSdOk=false force un SD.begin() avant le prochain enregistrement
   // (GetFile), pour ne jamais utiliser le volume FAT en cache sur une autre carte.
@@ -1263,7 +1308,15 @@ void OnImprimeLerreurViaLed(int mode)
   if (msg)
   {
     Serial.println(msg);
-    ClignoteLed(COUL_ROUGE, c2, d1, d2);
+    if (mode == 2)
+    {
+      // GPS : clignotement continu jusqu'au fix, sans bloquer le programme.
+      DemarreClignotementGps();
+    }
+    else
+    {
+      ClignoteLed(COUL_ROUGE, c2, d1, d2);
+    }
   }
   else
   {

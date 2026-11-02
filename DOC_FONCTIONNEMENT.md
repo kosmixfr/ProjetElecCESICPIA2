@@ -306,14 +306,18 @@ Table `COULEURS_LED[][3]` en `PROGMEM` (noir, vert, jaune, bleu, orange, rouge, 
 pour éviter une spécialisation par constantes (~250 o chacune).
 
 - `AfficheCouleurMode()` : jaune=CONFIG, bleu=ECO, orange=MAINTENANCE, vert=STANDARD (défaut).
-- `ClignoteLed(c1,c2,d1,d2)` : 4 alternances `d1/d2` puis retour couleur mode.
+- `ClignoteLed(c1,c2,d1,d2)` : bloquant, 4 alternances `d1/d2` puis retour couleur mode.
   1 Hz → `500/500` ; « 2x plus long » → `333/667`.
+- Erreur 2 (GPS sans fix) : **non bloquant et continu**. `DemarreClignotementGps()` pose
+  `gpsClignote=true`, `MajClignotementGps()` (appelée par `PompeGps()`, donc dans toutes les
+  attentes) alterne rouge/jaune toutes les 500 ms jusqu'au fix (`gps.location.isValid()`),
+  puis retour couleur mode. `ModeMaintenance()` l'arrête (pas de GPS requis en maintenance).
 - `OnImprimeLerreurViaLed(mode)` : `Serial.print("Erreur N : ...")` + clignotant :
 
 | Code | Série | LED alternée |
 |---|---|---|
 | 1 | horloge RTC | rouge / bleu 500/500 |
-| 2 | GPS sans fix | rouge / jaune 500/500 |
+| 2 | GPS sans fix | rouge / jaune 500/500, **continu** jusqu'au fix |
 | 3 | capteur BME280 | rouge / vert 500/500 |
 | 4 | donnée capteur incohérente | rouge / vert 333/667 |
 | 5 | accès carte SD | rouge / blanc 333/667 |
@@ -371,13 +375,16 @@ en `double` mais stockés via `float LesKordonnesGps[2]`.
 
 | Ressource | `uno` | `uno_sans_rtc` |
 |---|---|---|
-| RAM statique (.data + .bss + .noinit) | 1598 / 2048 o (78,0 %) | 1596 / 2048 o (77,9 %) |
-| Flash | 98,7 % (31824 o, **432 o libres**) | 98,4 % (31744 o, 512 o libres) |
+| RAM statique (.data + .bss + .noinit) | 1604 / 2048 o (78,3 %) | 1602 / 2048 o (78,2 %) |
+| Flash | 99,9 % (32242 o, **14 o libres**) | 99,7 % (32162 o, 94 o libres) |
+
+Mesure après clignotement GPS continu (§10) : +6 o de RAM statique (4 o `gpsDernierChangement`,
+2 bool) et +184 o de flash par rapport à la version précédente (32058 o).
 
 | Autre | Valeur | Remarque |
 |---|---|---|
 | Pile libre au boot | ~337 o | mesure historique (diagnostic §13.3 retiré) |
-| Pile libre minimale (cycle de mesure) | **17 o** | mesure historique, pic pendant l'écriture SD : marge trop faible |
+| Pile libre minimale (cycle de mesure) | **17 o** | mesure historique **avant** le clignotement GPS continu : à re-mesurer (-6 o de RAM statique) |
 | Tas maximal | 44 o | BME280 (4 `new` dans `begin()`), SD (1 `malloc` par `SD.open`) |
 
 La RAM statique a augmenté de 6 o avec le 15e paramètre (`PRESSURE`) : la marge de
