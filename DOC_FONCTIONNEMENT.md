@@ -5,7 +5,7 @@ Mesure température / humidité / pression (BME280), horodate (RTC DS1307),
 localise (GPS), stocke sur carte SD, signale par LED RGB et 2 boutons,
 configurable par liaison série.
 
-Fichiers : `src/main.cpp` (~1275 lignes), `src/main.h` (paramètres + `Record`),
+Fichiers : `src/main.cpp` (~1360 lignes), `src/main.h` (paramètres + `Record`),
 `platformio.ini` (2 environnements).
 
 ---
@@ -24,8 +24,8 @@ Fichiers : `src/main.cpp` (~1275 lignes), `src/main.h` (paramètres + `Record`),
 
 > La LED a été déplacée sur D8/D9 pour libérer D4 (CS SD) — D3 est le bouton vert.
 
-Contraintes : Uno ~32 Ko flash, projet à ~99,9 %. D'où optimisations radicales
-(see §9).
+Contraintes : Uno ~32 Ko flash, projet à ~100 %. D'où optimisations radicales
+(voir §11).
 
 ---
 
@@ -95,10 +95,12 @@ Ordre volontaire (commenté dans le code) :
 4. `InitLed()` → LED éteinte (noir).
 5. `InitRtc()` : 5 essais `rtc_clock.begin()`, sinon **erreur 1**. En `SANS_RTC` : message seul.
 6. `InitCapteur()` : 5 essais `capteur.begin(0x76)` puis `0x77`, sinon **erreur 3**.
-7. `InitSd()` : `pinMode(10, OUTPUT)` puis `SD.begin(4)`, sinon **erreur 5**.
+7. `InitSd()` : `pinMode(10, OUTPUT)`, `CS` à `HIGH` puis 300 ms, 3 essais de
+   `SD.begin(4)` (500 ms entre essais), sinon **erreur 5**.
 8. `InitEeprom()` : voir §6.
 9. `InitGps()` en dernier : `gpsSerial.begin(9600)`, attend `gps.location.isValid()`
-   avec timeout 120 s → **erreur 2** puis continue. En `SANS_RTC` affiche un `.` toutes les 5 s.
+   avec timeout 120 s → **erreur 2** puis continue. L'erreur 2 démarre le clignotement
+   rouge/jaune continu (non bloquant, cf. §10). En `SANS_RTC` affiche un `.` toutes les 5 s.
 10. Choix mode : `demandeConfig || bouton rouge (pressé/appui)` → `MODE_CONFIG`
     (`=CONFIG=` + prompt `> `), sinon `MODE_STANDARD`.
 
@@ -129,8 +131,8 @@ Contrôles `< ' '` ignorés sans echo (flèches ESC, etc.). Echo manuel par
   `RESET` remet les 15 paramètres à `LesDefauts` (flash) puis `OK` ;
   `VERSION` affiche `VERSION <v> lot <n>` puis `OK`.
   `CLOCK`, `DATE`, `DAY` **ne sont pas implémentés** : la conversion
-  date ↔ horodatage de RTClib coûtait ~830 o de flash alors qu'il n'en restait
-  que ~430 (§13.1) ; ces commandes répondent `Commande inconnu`.
+  date ↔ horodatage de RTClib coûte ~830 o de flash, pour seulement 14 o libres
+  actuellement (§13.1) ; ces commandes répondent `Commande inconnu`.
 - Sortie testée par `loop()` : `BoutonRougeAppuiLong()` ou 30 min sans saisie
   (`millis() - derniereActiviteConfig >= CONFIG_INACTIVITE_MS`) → `MODE_STANDARD`.
   `derniereActiviteConfig` est armé à l'entrée en config (fin de `setup()`) et repoussé
@@ -139,6 +141,8 @@ Contrôles `< ' '` ignorés sans echo (flèches ESC, etc.). Echo manuel par
   armé : un bouton encore tenu après les inits bloquantes — GPS jusqu'à 120 s —
   ne provoque pas de sortie immédiate). La sortie exige un NOUVEL appui long
   de 5 s (un front descendant ré-arme). Idem pour VERT (pas de ECO intempestif).
+  `ModeConfig()` n'appelle pas `PompeGps()` : un éventuel clignotement d'erreur 2
+  est suspendu pendant la config (LED jaune du mode) et reprend au retour en STANDARD.
 
 ### 5.2 `ModeNormalOrEco(bool ecoMode)` — bloquant avec attente active
 
@@ -159,10 +163,18 @@ Contrôles `< ' '` ignorés sans echo (flèches ESC, etc.). Echo manuel par
      - vert long + non-eco → `MODE_ECO`, return.
      - rouge long → si eco `MODE_STANDARD`, sinon `MODE_MAINTENANCE` (+ message série), return.
 
+Si `GetNewRecord` échoue faute de fix GPS (erreur 2, record `NULL`), l'enregistrement
+est sauté mais la boucle continue : le clignotement rouge/jaune reste actif pendant
+l'attente (`PompeGps()` → `MajClignotementGps()`) et s'arrête au premier fix valide.
+Le message série `Erreur 2 : GPS sans fix` est réimprimé à chaque acquisition ratée ;
+`DemarreClignotementGps()` est idempotent (pas de réinitialisation de la phase).
+
 ### 5.3 `ModeMaintenance()` — boucle affichage
 
 `sansPositionOk = true` → mesures intérieures sans fix GPS autorisées (position 0.00000).
-Entrée : `SD.end()` + `carteSdOk = false` → la carte peut être retirée ou changée ; le prochain
+Entrée : `gpsClignote = false` → arrêt du clignotement d'erreur 2 (le GPS n'est pas requis
+en maintenance ; la LED reprend la couleur orange du mode).
+`SD.end()` + `carteSdOk = false` → la carte peut être retirée ou changée ; le prochain
 enregistrement (retour en standard) refait `SD.begin()` dans `GetFile` avant toute écriture,
 pour ne jamais réutiliser le volume FAT en cache sur une autre carte.
 Boucle infinie :
@@ -253,7 +265,7 @@ moins la pile) est trop petit — `malloc` refusait systématiquement).
 
 1. **GPS** si `withGps` : `PompeGps()` (draine `gpsSerial` → `gps.encode()`),
    si `gps.location.isValid()` → maj `LesKordonnesGps[2]` (`float[2]`, initialisé à 0).
-   Sinon si `!sansPositionOk` → **erreur 2**, `NULL`.
+   Sinon si `!sansPositionOk` → **erreur 2** (clignotement continu, §10), `NULL`.
    Refus `0,0` (jamais de fix) si `!sansPositionOk` → **erreur 2**, `NULL`.
 2. **BME280** : `debut=millis()`, `clearWireTimeoutFlag()`,
    `temperature=readTemperature()`, `pression=readPressure()/100 (Pa→hPa)`,
@@ -293,8 +305,8 @@ moins la pile) est trop petit — `malloc` refusait systématiquement).
   fractionnaires, retourne fin de chaîne (pratique pour ajouter ` C`, ` %`, ` hPa`).
   `FormateChamp` l'enveloppe : si `isnan(v)`, écrit `NA` (3 o) à la place.
 
-Exemple de ligne : `48.85661;2.35222;21.45;55.12;1013.25`
-Capteur muet ou hors bornes : `48.85661;2.35222;NA;55.12;NA`
+Exemple de ligne : `26-01-01 00:00:05;48.85661;2.35222;21.45;55.12;1013.25`
+Capteur muet ou hors bornes : `26-01-01 00:00:05;48.85661;2.35222;NA;55.12;NA`
 
 ---
 
@@ -309,9 +321,15 @@ pour éviter une spécialisation par constantes (~250 o chacune).
 - `ClignoteLed(c1,c2,d1,d2)` : bloquant, 4 alternances `d1/d2` puis retour couleur mode.
   1 Hz → `500/500` ; « 2x plus long » → `333/667`.
 - Erreur 2 (GPS sans fix) : **non bloquant et continu**. `DemarreClignotementGps()` pose
-  `gpsClignote=true`, `MajClignotementGps()` (appelée par `PompeGps()`, donc dans toutes les
-  attentes) alterne rouge/jaune toutes les 500 ms jusqu'au fix (`gps.location.isValid()`),
-  puis retour couleur mode. `ModeMaintenance()` l'arrête (pas de GPS requis en maintenance).
+  `gpsClignote=true` et allume le rouge immédiatement (idempotent : un appel répété ne
+  réinitialise pas la phase), puis `MajClignotementGps()` (appelée par `PompeGps()`, donc
+  dans toutes les attentes) alterne rouge/jaune toutes les 500 ms jusqu'au fix
+  (`gps.location.isValid()`), puis rend la couleur du mode. `ModeMaintenance()` l'arrête
+  (pas de GPS requis en maintenance) ; en CONFIG il est suspendu (`PompeGps()` non appelé,
+  cf. §5.1). Le message `Erreur 2` reste imprimé à chaque acquisition GPS ratée : seule
+  la signalisation LED est continue.
+- Les autres codes (1, 3, 4, 5, 6) conservent `ClignoteLed()` : 4 alternances bloquantes
+  (~4 s) puis retour à la couleur du mode.
 - `OnImprimeLerreurViaLed(mode)` : `Serial.print("Erreur N : ...")` + clignotant :
 
 | Code | Série | LED alternée |
@@ -334,7 +352,8 @@ les codes `3`/`4` donnent maintenant `NA`).
 ## 11. Optimisations mémoire (flash/RAM)
 
 Flash saturée → chaque octet compte (`platformio.ini`, commentaires code) :
-`-flto -Os -mcall-prologues`, `F()`/`PSTR`/`sprintf_P`/`snprintf_P`/`strcmp_P` partout,
+`-flto -Os -mcall-prologues`, `F()`/`PSTR`/`strcmp_P` partout, pas de
+`sprintf_P`/`snprintf_P` (vfprintf coûterait ~950 o : formatage manuel),
 noms paramètres en `PROGMEM`, `FormatDecimal` maison, parsing entier manuel
 (au lieu de `strtol`), `noinline,noclone` LED, pas de `String` Arduino,
 ni de `malloc`/`free` (record statique : le tas est trop petit),
@@ -360,6 +379,9 @@ Budget RAM/pile/flash : voir §13 (avant tout ajout).
    rouge long en STANDARD → MAINTENANCE (orange, tableau série chaque ~1 s) ;
    rouge long en MAINTENANCE → STANDARD.
 5. En `SANS_RTC`, dates fictives 01/01/2026 + uptime ; GPS timeout 120 s max au boot.
+6. Sans fix GPS : message `Erreur 2 : GPS sans fix` et clignotement rouge/jaune continu
+   jusqu'au fix ; les mesures GPS sont sautées mais le programme continue de tourner
+   (attente, boutons, passage ECO/MAINTENANCE).
 
 Limites connues : `TIMEOUT` documenté en secondes mais comparé à `millis()` en ms
 (`*1000`), `ProcessCommande` refuse `>100000000` avant bornes, `Record.Latitude/Longitude`
@@ -376,7 +398,7 @@ en `double` mais stockés via `float LesKordonnesGps[2]`.
 | Ressource | `uno` | `uno_sans_rtc` |
 |---|---|---|
 | RAM statique (.data + .bss + .noinit) | 1604 / 2048 o (78,3 %) | 1602 / 2048 o (78,2 %) |
-| Flash | 99,9 % (32242 o, **14 o libres**) | 99,7 % (32162 o, 94 o libres) |
+| Flash | 100,0 % (32242 o, **14 o libres**) | 99,7 % (32162 o, 94 o libres) |
 
 Mesure après clignotement GPS continu (§10) : +6 o de RAM statique (4 o `gpsDernierChangement`,
 2 bool) et +184 o de flash par rapport à la version précédente (32058 o).
@@ -467,7 +489,7 @@ Conforme :
 Le PDF (5 pages) décrit les 4 modes, les couleurs LED, les paramètres, les commandes
 série et la rotation des fichiers. Le code respecte les modes, les couleurs, les appuis
 5 s, les 30 min et la désactivation des mesures en CONFIG. État après la mise en
-conformité (build 98,7 % de flash) :
+conformité (build actuel : 100,0 % de flash, 14 o libres) :
 
 | Cahier des charges | État | Remarque |
 |---|---|---|
@@ -478,8 +500,8 @@ conformité (build 98,7 % de flash) :
 | paramètre `PRESSURE` {0,1} | **conforme** | 15 paramètres, `0` → pression `NA` |
 | `PRESSURE_MIN=850`, `PRESSURE_MAX=1080` | **conforme** | idem dans `LesDefauts` |
 | activations `TEMP_AIR` / `HYGR` | **conforme** | `0` → `NA` ; `LUMIN_*` restent réservés (pas de capteur) |
-| `CLOCK`, `DATE`, `DAY` | **non implémenté** | la conversion date ↔ horodatage de RTClib coûte ~830 o ; il ne reste que 432 o libres. Ces commandes répondent `Commande inconnu` |
-| rotation : toujours écrire en révision 0, copier le fichier plein en révision suivante | **non implémenté** | copier exige 2 objets `File` (~44 o de pile) + un tampon, incompatible avec 17 o de marge (§13.1). Le code écrit `_0` … `_9` : mêmes données, numérotation différente |
+| `CLOCK`, `DATE`, `DAY` | **non implémenté** | la conversion date ↔ horodatage de RTClib coûte ~830 o ; il ne reste que 14 o libres. Ces commandes répondent `Commande inconnu` |
+| rotation : toujours écrire en révision 0, copier le fichier plein en révision suivante | **non implémenté** | copier exige 2 objets `File` (~44 o de pile) + un tampon, incompatible avec la marge de pile (§13.1). Le code ouvre directement la révision `rr` en base 36 (`00`…`ZZ`, §9) : mêmes données, numérotation différente |
 | maintenance accessible depuis STANDARD **ou** ECO, retour au mode précédent | **écart assumé** | contradiction interne du PDF ; « ECO → rouge long → STANDARD » conservé (§14) |
 
 Rappel : `TIMEOUT` est bien en secondes dans le code (`* 1000`), et 2 échecs consécutifs
